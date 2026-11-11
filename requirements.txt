@@ -1,0 +1,8 @@
+ipykernel==7.4.0
+jupyterlab==4.6.6
+matplotlib==3.11.2
+numpy==2.5.4
+pandas==3.1.1
+polars==2.1.0
+requests==2.34.2
+statsmodels==0.15.0

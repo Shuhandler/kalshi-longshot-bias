@@ -12,7 +12,7 @@ The project has three layers, built in order: **replicate** the paper's main tab
 
 The paper is [Bürgi, Deng and Whelan, "Makers and Takers: The Economics of the Kalshi Prediction Market"](https://www.karlwhelan.com/Papers/Kalshi.pdf) (Jan 2026 version; earlier [UCD WP25/19](https://www.ucd.ie/economics/t4media/WP2025_19.pdf)). It is descriptive: it measures returns by price and by maker/taker side, but never tests a trading strategy, so layer 3 is our own construction.
 
-The code is in two files: `download_data.py` pulls the Kalshi data, and the Jupyter notebook `kalshi_longshot.ipynb` does all cleaning and evaluation. Both use plain pandas, Polars, statsmodels and matplotlib, and neither depends on the research toolkit.
+The code is plain Python scripts: `download_data.py` pulls the Kalshi data, and `config.py`, `stats.py`, `sample.py` and `replicate.py` (later `backtest.py` and `calibration.py`) do the cleaning and evaluation (see the code structure section). They use plain pandas, Polars, statsmodels and matplotlib, and do not depend on the research toolkit.
 
 ## Decisions to make before building
 
@@ -32,33 +32,31 @@ These are the design choices worth settling first; the suggested default is list
 
 1. **Read the paper's data and method sections closely.** Note the exact price definition, the snapshot days before close, how returns are computed for Yes and No, how makers and takers are identified, and which tables and figures you will reproduce (Table 2 counts, the return-by-price figure, the price regression, maker vs taker returns).
 2. **Test Kalshi data access from your Mac.** The cloud environment cannot reach Kalshi, so run the first notebook cells via Remote Control. Base URL `https://external-api.kalshi.com/trade-api/v2`; check `/historical/cutoff`, list settled markets, and pull candlesticks and trades for a few tickers. Confirm the fields you need exist: settlement result, open and close times, volume, series category, bid/ask in candles, and the taker side on trades. Note the rate limits.
-3. **Write the data download functions in `download_data.py`.** Paginated downloaders for series, events, markets, candlesticks and trades, with caching to disk so the full pull can resume after interruption (see the notebook structure section).
+3. **Write the data download functions in `download_data.py`.** Paginated downloaders for series, events, markets, candlesticks and trades, with caching to disk so the full pull can resume after interruption (see the code structure section).
 4. **Pull the full history.** All settled markets from 2021 to the latest settled date, then candles and trades for markets that pass a loose pre-filter. Expect this to take hours; run it once and keep the cache.
 5. **Build the paper's sample.** Apply its filters: at least $1,000 final volume, final spread of 20c or less, open at least 24 hours, hourly crypto and index markets excluded, sample ending April 2025. Create one row per contract side (Yes and No) per snapshot. Check your counts against the paper's 46,282 contracts and 12,403 events.
 6. **Replicate the main results.** Win rate and average return by 10c price bucket, before and after the taker fee; the overall average return (about -20% before fees, -22% after); the regression of returns on price; maker vs taker average returns using the trade-level taker side; results by category and by year.
 7. **Extend out of sample.** Rerun step 6 unchanged on May 2025 to October 2026. This is the first real test: does the bias still exist after publication, and is it weaker?
-8. **Backtest the rules-based strategy.** Weekly, buy the leading side of qualifying non-sports contracts priced 85–97c with 1–21 days to close, using liquidity measured on the entry date. Equal weight per event, 3% event cap, category cap, hold to settlement, taker fees and spread, 3.5% interest on cash and positions. Report annual return, volatility, Sharpe, maximum drawdown, VaR and expected shortfall, hit rate and worst week, all computed in the notebook.
+8. **Backtest the rules-based strategy.** Weekly, buy the leading side of qualifying non-sports contracts priced 85–97c with 1–21 days to close, using liquidity measured on the entry date. Equal weight per event, 3% event cap, category cap, hold to settlement, taker fees and spread, 3.5% interest on cash and positions. Report annual return, volatility, Sharpe, maximum drawdown, VaR and expected shortfall, hit rate and worst week, all computed in `backtest.py`.
 9. **Add the calibration model.** Fit a logistic regression of win on log-odds of price, days to close and category using only pre-May-2025 data, check calibration, freeze it, and trade only where the predicted edge beats costs. Compare it with step 8 out of sample.
 10. **Write up.** Strategy summary, origin, replication results, out-of-sample results, backtest, improvement, and a judgment section on skew, capacity, crowding and legal risk.
 
-## Notebook structure
+## Code structure
 
-`download_data.py` writes the data to a `data/` folder next to the notebook. The notebook loads those files, defines its helper functions near the top, and puts each section of the analysis below them, so it can be rerun without downloading again.
+The analysis moved from the notebook into plain scripts on 2026-11-12 (the notebook is kept but frozen). `download_data.py` writes the data to `data/`; the other scripts read only from there.
 
-| Section | Contents |
+| Script | Contents |
 |---|---|
-| `download_data.py` | Paginated, signed downloaders for series, markets, candlesticks and trades, with on-disk caching and resume; run once from the Mac |
-| 1. Setup | Imports, constants (sample dates, filters, fee multipliers, interest rate) |
-| 2. Load data | Read `data/series.parquet`, `markets.parquet` and `candles.parquet` |
-| 3. Helper functions | Fee for a binary contract with round-up; settlement portfolio that marks positions daily, settles at 0 or 1 and accrues interest; calibration table by price bucket; performance and tail-risk statistics |
-| 4. Paper sample | Filters, Yes/No rows per snapshot, count check against the paper |
-| 5. Replication | Return-by-price table and chart, fee effect, price regression, makers vs takers, by category and year |
-| 6. Out of sample | Same tables for May 2025 to October 2026 |
-| 7. Strategy backtest | Rules-based favourite buying, NAV, performance and tail statistics |
-| 8. Calibration model | Fit on pre-May-2025 data, reliability check, out-of-sample comparison with section 7 |
-| 9. Conclusions | Short markdown summary of findings and judgment |
+| `download_data.py` | Paginated, signed downloaders for series, markets, candlesticks, trades and events, with on-disk caching and resume; run from the Mac |
+| `config.py` | Sample dates, filters, fee rate, interest rate, strategy settings, the paper's published numbers |
+| `stats.py` | Taker fee with round-up, price ranges, mean with confidence interval, Mincer-Zarnowitz regression with clustered errors |
+| `sample.py` | Paper filters, price snapshots, Yes/No observations for both periods (steps 5 and 7 inputs) |
+| `replicate.py --period paper` | Step 6: Tables 1, 2, 4 to 10 and Figures 3, 5, 6, each next to the paper's number |
+| `replicate.py --period oos` | Step 7: the same code on May 2025 to October 2026 |
+| `backtest.py` (to do) | Step 8: rules-based favourite buying, NAV, performance and tail statistics |
+| `calibration.py` (to do) | Step 9: fit on pre-May-2025 data, reliability check, out-of-sample comparison with step 8 |
 
-The settlement portfolio function is the largest piece of new code. Keep it general (any table of entries with instrument, entry date, price, size and settlement value) so sections 7 and 8 share it.
+The settlement portfolio function is the largest piece of new code. Keep it general (any table of entries with instrument, entry date, price, size and settlement value) so `backtest.py` and `calibration.py` share it.
 
 ## Validation targets and risks
 

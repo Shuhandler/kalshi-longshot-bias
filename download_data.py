@@ -5,6 +5,7 @@ Download the Kalshi data used by kalshi_longshot.ipynb.
     .venv/bin/python download_data.py trades   # trades for the sample in data/trade_tickers.parquet
     .venv/bin/python download_data.py paper-extra   # sports and daily crypto/index markets up to April 2025
     .venv/bin/python download_data.py events   # event details (mutually exclusive or not) for the sample
+    .venv/bin/python download_data.py oos      # overnight: OOS trades, then daily markets in "hourly" series
 
 Everything is cached under data/ (git-ignored), one Parquet file per series, so a run that stops
 can be restarted and skips what is already on disk. The first command also writes two combined files
@@ -361,6 +362,66 @@ def download_paper_extra():
     print(f"Candles for {len(wanted):,} extra markets -> {path}")
 
 
+# --- Daily markets inside "hourly" series, out of sample (Jordan, 2026-11-12) ---
+# Same reason as paper_extra: the paper keeps any market open at least 24 hours. After mid-2025 the
+# exchange trades too much to download every trade by day, so here we list the hourly and 15-minute
+# series directly and keep only the markets that could pass the filters as we page, because a series
+# like KXBTCD lists millions of hourly markets.
+OOS_EXTRA = DATA / "oos_extra"
+OOS_START = dt.datetime(2025, 5, 1, tzinfo=dt.timezone.utc)
+
+
+def could_pass(m):
+    """Loose pre-filter on one raw market record: settled Yes/No, out of sample, >= 1,000 contracts, open >= 24 hours."""
+    close, opened = dt.datetime.fromisoformat(m["close_time"].replace("Z", "+00:00")), dt.datetime.fromisoformat(m["open_time"].replace("Z", "+00:00"))
+    return (m.get("market_type") == "binary" and m.get("result") in ("yes", "no")
+            and OOS_START <= close < DOWNLOAD_END
+            and float(m.get("volume_fp") or 0) >= MIN_CONTRACTS_TRADED
+            and close - opened >= dt.timedelta(hours=MIN_HOURS_OPEN))
+
+
+def pull_oos_extra_series(series_ticker):
+    """Markets in one hourly series that could pass the filters, with their candles and trades."""
+    path = OOS_EXTRA / "markets" / f"{series_ticker}.parquet"
+    if path.exists():
+        return
+    rows = []
+    for source, endpoint, extra in [("historical", "/historical/markets", {}), ("live", "/markets", {"status": "settled"})]:
+        cursor = None
+        while True:
+            page = get(endpoint, series_ticker=series_ticker, limit=1000, cursor=cursor, **extra)
+            rows += [{k: v for k, v in m.items() if k not in MARKET_DROP} | {"series_ticker": series_ticker, "source": source}
+                     for m in page.get("markets", []) if could_pass(m)]
+            cursor = page.get("cursor")
+            if not cursor:
+                break
+    markets = to_text_table(rows)
+    # Candles and trades in chunks of 500 markets, so a big series (millions of trades) never sits in memory at once
+    for i, chunk in enumerate(markets.iter_slices(500)):
+        with ThreadPoolExecutor(WORKERS) as pool:
+            candles = [r for rs in pool.map(lambda m: candles_for_market(series_ticker, m), chunk.iter_rows(named=True)) for r in rs]
+            trades = [t for market_trades in pool.map(trades_for_market, chunk.iter_rows(named=True)) for t in market_trades]
+        to_text_table(candles).write_parquet(OOS_EXTRA / "candles" / f"{series_ticker}__{i}.parquet")
+        to_text_table(trades).write_parquet(OOS_EXTRA / "trades" / f"{series_ticker}__{i}.parquet")
+    markets.write_parquet(path)        # written last, so an interrupted series is redone on restart
+
+
+def download_oos_extra():
+    """Every non-sports hourly or 15-minute series; files under data/oos_extra/."""
+    for folder in ["markets", "candles", "trades"]:
+        (OOS_EXTRA / folder).mkdir(parents=True, exist_ok=True)
+    series = pull_series().filter(
+        pl.col("frequency").is_in(list(SKIP_FREQUENCIES))
+        & ~pl.col("category").is_in(list(SKIP_CATEGORIES))
+        & ~pl.col("ticker").str.starts_with("KXMVE")
+    )["ticker"].to_list()
+    print(f"Hourly and 15-minute series: {len(series)}")
+    start = time.time()
+    for i, ticker in enumerate(series, 1):
+        pull_oos_extra_series(ticker)
+        print(f"  {i} of {len(series)} series done ({ticker}), {(time.time() - start) / 60:.0f} min")
+
+
 # --- Event details for the sample (paper Table 4 needs to know if an event is mutually exclusive) ---
 EVENT_COLUMNS = ["event_ticker", "series_ticker", "title", "category", "mutually_exclusive"]
 
@@ -399,5 +460,9 @@ if __name__ == "__main__":
         download_paper_extra()
     elif sys.argv[1:] == ["events"]:
         download_events()
+    elif sys.argv[1:] == ["oos"]:
+        download_trades()
+        download_oos_extra()
+        print("All out-of-sample downloads finished.")
     else:
         download_candles(download_markets())

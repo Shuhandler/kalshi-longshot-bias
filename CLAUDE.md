@@ -7,14 +7,20 @@ buying (85–97c favourites, interest carry on cash). The full plan is in [PLAN.
 ## Code style
 
 - **The code must not be overly complex. It must be readable and reproducible.**
-- Two files only (Jordan, 2026-11-11): `download_data.py` downloads from the Kalshi API, and the notebook
-  `kalshi_longshot.ipynb` does all cleaning and evaluation. The notebook never calls the API. No package,
-  no other scripts, and do not use Jordan's research toolkit here.
+- Plain Python scripts (Jordan, 2026-11-12), run from the repo folder with `.venv/bin/python`:
+  - `download_data.py`: every Kalshi API download (the only script that calls the API).
+  - `config.py`: every analysis setting and the paper's published numbers, defined once.
+  - `stats.py`: small shared helpers (taker fee, price ranges, mean with CI, Mincer-Zarnowitz regression).
+  - `sample.py`: paper filters, price snapshots, Yes/No observations -> `data/observations_{paper,oos}.parquet`.
+  - `replicate.py --period paper|oos`: the paper's tables and figures -> `results/{period}/` (CSV and PNG).
+  - Later: `backtest.py` (strategy) and `calibration.py` (logistic model).
+- `kalshi_longshot.ipynb` is kept but frozen; the scripts are the source of truth. Jordan keeps a separate
+  Google Colab notebook for the team; don't edit or track it. No package, no classes where a function
+  will do, and do not use Jordan's research toolkit here.
 - Plain pandas, Polars, statsmodels, matplotlib and requests. Prefer a short, obvious function over a
-  clever one. Every constant is defined once: download settings at the top of `download_data.py`, analysis
-  settings (dates, filters, fees, interest rate) in the notebook's Setup section.
-- The notebook must run top to bottom from the files in `data/`. The script caches per series, so a rerun
-  resumes instead of downloading again.
+  clever one. Download settings live at the top of `download_data.py`, analysis settings in `config.py`.
+- Every script reruns from the files in `data/`. Downloads cache per series, so a rerun resumes.
+- `data/` and `results/` are git-ignored.
 
 ## Environment
 
@@ -40,6 +46,9 @@ buying (85–97c favourites, interest carry on cash). The full plan is in [PLAN.
   `data/paper_extra/`. The notebook's 24-hour filter keeps truly hourly markets out; flag `INCLUDE_PAPER_EXTRA`.
 - `download_data.py events` saves event details (incl. `mutually_exclusive`) for every sample event to
   `data/events.parquet`; used for the paper's Table 4 contract types.
+- `download_data.py oos` (overnight): remaining out-of-sample trades, then the daily (>= 24h) markets inside
+  hourly/15-minute non-sports series for May 2025 to Oct 2026, with their candles and trades, under `data/oos_extra/`
+  (candles and trades in 500-market chunks: `{series}__{i}.parquet`).
 - Skip multivariate combo series (tickers starting `KXMVE`); they dominate the raw listing. `mve_filter`
   cannot be combined with `series_ticker`.
 - Usable history starts July 2021. Prices come as dollar strings (`*_dollars`), volumes as `*_fp` strings.

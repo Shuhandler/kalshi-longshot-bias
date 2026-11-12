@@ -34,12 +34,19 @@ buying (85–97c favourites, interest carry on cash). The full plan is in [PLAN.
 - Historical markets can only be filtered by series or event ticker, so the pull loops over every series
   from `GET /series`. Old tickers were renamed (`FED-21DEC` sits under series `KXFED`).
 - Sports series are left out of every pull for now (Jordan, 2026-11-11).
+- Exception for the paper period only (Jordan, 2026-11-12): `download_data.py paper-extra` downloads every
+  exchange trade by day (Jul 2021 to Apr 2025) and adds the traded markets our series listing skipped
+  (sports, and daily markets inside "hourly" crypto/index series such as KXBTCD and INXU) under
+  `data/paper_extra/`. The notebook's 24-hour filter keeps truly hourly markets out; flag `INCLUDE_PAPER_EXTRA`.
 - Skip multivariate combo series (tickers starting `KXMVE`); they dominate the raw listing. `mve_filter`
   cannot be combined with `series_ticker`.
 - Usable history starts July 2021. Prices come as dollar strings (`*_dollars`), volumes as `*_fp` strings.
 - Cache everything as Parquet (Polars) under `data/`, which is git-ignored. The script writes combined
-  `data/series.parquet`, `markets.parquet`, `candles.parquet` (and `trades.parquet` with the `trades` argument,
-  for tickers the notebook saves to `data/trade_tickers.parquet`).
+  `data/series.parquet`, `markets.parquet`, `candles.parquet` (and trades with the `trades` argument,
+  for tickers the notebook saves to `data/trade_tickers.parquet`). Trades stay one file per series and period
+  (`data/trades/{series}__{paper|oos}.parquet`), with no combined file; read them lazily with `pl.scan_parquet`.
+- Trades have their own archive cutoff: a live market can have older trades in `/historical/trades`, so live
+  markets query both trade endpoints.
 
 ## Secrets
 

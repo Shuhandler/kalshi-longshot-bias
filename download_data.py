@@ -2,11 +2,12 @@
 Download the Kalshi data used by kalshi_longshot.ipynb.
 
     .venv/bin/python download_data.py          # series, market listing and daily candles
-    .venv/bin/python download_data.py trades   # trades for the tickers in data/trade_tickers.parquet
+    .venv/bin/python download_data.py trades   # trades for the sample in data/trade_tickers.parquet
+    .venv/bin/python download_data.py paper-extra   # sports and daily crypto/index markets up to April 2025
 
 Everything is cached under data/ (git-ignored), one Parquet file per series, so a run that stops
-can be restarted and skips what is already on disk. When it finishes it writes two combined files
-for the notebook: data/markets.parquet and data/candles.parquet.
+can be restarted and skips what is already on disk. The first command also writes two combined files
+for the notebook: data/markets.parquet and data/candles.parquet. Trades stay one file per series.
 
 Kalshi splits its data in two. Markets that settled before the historical cutoff are only under
 /historical/...; newer ones are on the live endpoints. Each function reads both. Historical markets
@@ -189,21 +190,30 @@ def pull_candles(series_ticker, markets):
     return pl.read_parquet(path)
 
 
+TRADE_COLUMNS = ["ticker", "created_time", "yes_price_dollars", "count_fp", "taker_outcome_side", "is_block_trade"]
+
+
 def trades_for_market(m):
-    """Every trade, with the taker's side, for one market."""
-    endpoint = "/historical/trades" if m["source"] == "historical" else "/markets/trades"
-    return get_all(endpoint, "trades", ticker=m["ticker"], limit=1000)
+    """Every trade for one market, keeping only the columns the notebook uses.
+
+    Trades have their own archive cutoff, so a market that settled recently can still have its older
+    trades in the archive. Archived markets need only the archive; live markets need both.
+    """
+    trades = get_all("/historical/trades", "trades", ticker=m["ticker"], limit=1000)
+    if m["source"] == "live":
+        trades += get_all("/markets/trades", "trades", ticker=m["ticker"], limit=1000)
+    unique = {t["trade_id"]: t for t in trades}.values()      # a trade could be in both while it moves
+    return [{k: t.get(k) for k in TRADE_COLUMNS} for t in unique]
 
 
-def pull_trades(series_ticker, markets):
-    """Every trade for the given markets of one series, WORKERS requests at a time."""
-    path = DATA / "trades" / f"{series_ticker}.parquet"
+def pull_trades(name, markets):
+    """Every trade for the given markets, saved as data/trades/{name}.parquet, WORKERS requests at a time."""
+    path = DATA / "trades" / f"{name}.parquet"
     if not path.exists():
         with ThreadPoolExecutor(WORKERS) as pool:
             rows = [t for market_trades in pool.map(trades_for_market, markets.iter_rows(named=True))
                     for t in market_trades]
         to_text_table(rows).write_parquet(path)
-    return pl.read_parquet(path)
 
 
 # --- Steps ---
@@ -266,20 +276,88 @@ def download_candles(markets):
 
 
 def download_trades():
-    """Optional step: trades for the tickers the notebook saved to data/trade_tickers.parquet."""
-    tickers = pl.read_parquet(DATA / "trade_tickers.parquet")["ticker"]
-    markets = pl.read_parquet(DATA / "markets.parquet").filter(pl.col("ticker").is_in(tickers))
-    groups = sorted(markets.partition_by("series_ticker", as_dict=True).items())
-    print(f"Trades for {len(markets):,} markets in {len(groups):,} series")
-    start = time.time()
-    for i, ((ticker,), group) in enumerate(groups, 1):
-        pull_trades(ticker, group)
-        if i % 100 == 0:
-            print(f"{i:,} of {len(groups):,} series done, {(time.time() - start) / 60:.0f} min")
+    """Trades for the sample the notebook saved to data/trade_tickers.parquet, paper period first.
 
-    trades = combine("trades")
-    trades.write_parquet(DATA / "trades.parquet")
-    print(f"{len(trades):,} trades -> data/trades.parquet")
+    One file per series and period under data/trades/. There is no combined file: the full trade
+    history is too large to hold in memory, so the notebook reads these files lazily.
+    """
+    sample = pl.read_parquet(DATA / "trade_tickers.parquet")              # columns: ticker, period
+    markets = pl.read_parquet(DATA / "markets.parquet").join(sample, on="ticker")
+    for period in ["paper", "oos"]:
+        groups = sorted(markets.filter(pl.col("period") == period).partition_by("series_ticker", as_dict=True).items())
+        n_markets = sum(len(g) for _, g in groups)
+        print(f"{period}: trades for {n_markets:,} markets in {len(groups):,} series")
+        start = time.time()
+        for i, ((ticker,), group) in enumerate(groups, 1):
+            pull_trades(f"{ticker}__{period}", group)
+            if i % 100 == 0:
+                print(f"  {i:,} of {len(groups):,} series done, {(time.time() - start) / 60:.0f} min")
+
+
+# --- Extra markets for the paper period (Jordan, 2026-11-12) ---
+# The series listing skips sports and every series tagged hourly or 15-minute. The paper instead keeps
+# any market open at least 24 hours, and many markets in "hourly" crypto and index series (KXBTCD, INXU,
+# ...) are daily markets. Before May 2025 the whole exchange traded little, so the quickest way to find
+# these markets is to download every trade by day, take the traded tickers our listing does not have,
+# and look those markets up by ticker. The 24-hour rule is applied in the notebook, so markets that
+# really are hourly stay out of the sample.
+EXTRA = DATA / "paper_extra"
+EXTRA_START = dt.date(2021, 6, 30)
+EXTRA_END = dt.date(2025, 5, 1)          # paper sample ends April 2025
+
+
+def pull_trades_for_day(day):
+    """Every trade on the exchange on one day (UTC), saved as data/paper_extra/trades_by_day/{day}.parquet."""
+    path = EXTRA / "trades_by_day" / f"{day}.parquet"
+    if not path.exists():
+        start = int(dt.datetime.combine(day, dt.time(), dt.timezone.utc).timestamp())
+        trades = get_all("/historical/trades", "trades", min_ts=start, max_ts=start + 86_400, limit=1000)
+        to_text_table([{k: t.get(k) for k in TRADE_COLUMNS} for t in trades]).write_parquet(path)
+
+
+def download_paper_extra():
+    """Markets missing from the listing that closed before May 2025, with their candles and trades."""
+    (EXTRA / "trades_by_day").mkdir(parents=True, exist_ok=True)
+
+    # 1. Every trade on the exchange, one file per day
+    days = [EXTRA_START + dt.timedelta(d) for d in range((EXTRA_END - EXTRA_START).days)]
+    start = time.time()
+    with ThreadPoolExecutor(WORKERS) as pool:
+        for i, _ in enumerate(pool.map(pull_trades_for_day, days), 1):
+            if i % 100 == 0:
+                print(f"{i:,} of {len(days):,} days of trades, {(time.time() - start) / 60:.0f} min")
+
+    # 2. Traded markets our listing does not have, apart from multivariate combos.
+    #    A market ticker starts with its series ticker (KXBTCD-25JAN1717-T100000).
+    listed = pl.read_parquet(DATA / "markets.parquet", columns=["ticker"])["ticker"]
+    all_trades = combine("paper_extra/trades_by_day").unique()     # a trade on a midnight boundary is in two days
+    extra_trades = all_trades.filter(~pl.col("ticker").is_in(listed.implode()) & ~pl.col("ticker").str.starts_with("KXMVE"))
+    tickers = extra_trades["ticker"].unique().sort().to_list()
+    print(f"{len(all_trades):,} trades on the exchange; {len(extra_trades):,} in {len(tickers):,} markets not in our listing")
+
+    # 3. Their market records, 100 tickers per request; keep those settled before May 2025
+    path = EXTRA / "markets.parquet"
+    if not path.exists():
+        rows = []
+        for i in range(0, len(tickers), 100):
+            for m in get("/historical/markets", tickers=",".join(tickers[i:i + 100]), limit=1000).get("markets", []):
+                rows.append({k: v for k, v in m.items() if k not in MARKET_DROP}
+                            | {"series_ticker": m["ticker"].split("-")[0], "source": "historical"})
+        markets = to_text_table(rows)
+        end = dt.datetime.combine(EXTRA_END, dt.time(), dt.timezone.utc)
+        markets.filter(pl.col("close_time").str.to_datetime(time_zone="UTC") < end).write_parquet(path)
+    markets = pl.read_parquet(path)
+    print(f"{len(markets):,} extra markets closing before May 2025 -> {path}")
+
+    # 4. Their trades, and daily candles for those that pass the loose pre-filter
+    extra_trades.filter(pl.col("ticker").is_in(markets["ticker"].implode())).write_parquet(EXTRA / "trades.parquet")
+    wanted = candle_markets(markets)
+    path = EXTRA / "candles.parquet"
+    if not path.exists():
+        with ThreadPoolExecutor(WORKERS) as pool:
+            per_market = pool.map(lambda m: candles_for_market(m["series_ticker"], m), wanted.iter_rows(named=True))
+            to_text_table([row for rows in per_market for row in rows]).write_parquet(path)
+    print(f"Candles for {len(wanted):,} extra markets -> {path}")
 
 
 if __name__ == "__main__":
@@ -288,5 +366,7 @@ if __name__ == "__main__":
     print("Historical cutoff:", get("/historical/cutoff"))
     if sys.argv[1:] == ["trades"]:
         download_trades()
+    elif sys.argv[1:] == ["paper-extra"]:
+        download_paper_extra()
     else:
         download_candles(download_markets())

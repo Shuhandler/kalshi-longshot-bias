@@ -225,3 +225,6 @@ keys/
 *private*.txt
 data/
 .DS_Store
+results/
+*.zip
+kalshi_longshot.ipynb

@@ -4,6 +4,7 @@ Download the Kalshi data used by kalshi_longshot.ipynb.
     .venv/bin/python download_data.py          # series, market listing and daily candles
     .venv/bin/python download_data.py trades   # trades for the sample in data/trade_tickers.parquet
     .venv/bin/python download_data.py paper-extra   # sports and daily crypto/index markets up to April 2025
+    .venv/bin/python download_data.py events   # event details (mutually exclusive or not) for the sample
 
 Everything is cached under data/ (git-ignored), one Parquet file per series, so a run that stops
 can be restarted and skips what is already on disk. The first command also writes two combined files
@@ -360,6 +361,34 @@ def download_paper_extra():
     print(f"Candles for {len(wanted):,} extra markets -> {path}")
 
 
+# --- Event details for the sample (paper Table 4 needs to know if an event is mutually exclusive) ---
+EVENT_COLUMNS = ["event_ticker", "series_ticker", "title", "category", "mutually_exclusive"]
+
+
+def event_details(event_ticker):
+    """One event's details, without its markets."""
+    event = get(f"/events/{event_ticker}").get("event", {})
+    return {k: event.get(k) for k in EVENT_COLUMNS} | {"event_ticker": event_ticker}
+
+
+def download_events():
+    """Details for every event in data/trade_tickers.parquet, saved as data/events.parquet."""
+    path = DATA / "events.parquet"
+    if path.exists():
+        return
+    sample = pl.read_parquet(DATA / "trade_tickers.parquet")
+    markets = pl.read_parquet(DATA / "markets.parquet", columns=["ticker", "event_ticker"])
+    extra = EXTRA / "markets.parquet"
+    if extra.exists():
+        markets = pl.concat([markets, pl.read_parquet(extra, columns=["ticker", "event_ticker"])])
+    events = markets.join(sample, on="ticker")["event_ticker"].unique().sort().to_list()
+    print(f"Details for {len(events):,} events")
+    with ThreadPoolExecutor(WORKERS) as pool:
+        rows = list(pool.map(event_details, events))
+    to_text_table(rows).write_parquet(path)
+    print(f"-> {path}")
+
+
 if __name__ == "__main__":
     for folder in ["markets", "candles", "trades"]:
         (DATA / folder).mkdir(parents=True, exist_ok=True)
@@ -368,5 +397,7 @@ if __name__ == "__main__":
         download_trades()
     elif sys.argv[1:] == ["paper-extra"]:
         download_paper_extra()
+    elif sys.argv[1:] == ["events"]:
+        download_events()
     else:
         download_candles(download_markets())

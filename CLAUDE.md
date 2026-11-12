@@ -38,6 +38,8 @@ buying (85–97c favourites, interest carry on cash). The full plan is in [PLAN.
   exchange trade by day (Jul 2021 to Apr 2025) and adds the traded markets our series listing skipped
   (sports, and daily markets inside "hourly" crypto/index series such as KXBTCD and INXU) under
   `data/paper_extra/`. The notebook's 24-hour filter keeps truly hourly markets out; flag `INCLUDE_PAPER_EXTRA`.
+- `download_data.py events` saves event details (incl. `mutually_exclusive`) for every sample event to
+  `data/events.parquet`; used for the paper's Table 4 contract types.
 - Skip multivariate combo series (tickers starting `KXMVE`); they dominate the raw listing. `mve_filter`
   cannot be combined with `series_ticker`.
 - Usable history starts July 2021. Prices come as dollar strings (`*_dollars`), volumes as `*_fp` strings.

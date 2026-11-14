@@ -54,10 +54,10 @@ def by_price_range(df):
 
 def headline_counts(obs):
     yes = obs.filter(pl.col("side") == "yes")
-    main = yes.filter(~pl.col("extra"))
+    main = yes.filter(pl.col("source") == "listing")
     count = lambda d: [d["event_ticker"].n_unique(), d["ticker"].n_unique(), len(d), 2 * len(d)]
     return pl.DataFrame({"count": list(PAPER["counts"]), "ours": count(yes),
-                         "main_listing_only": count(main), "paper": list(PAPER["counts"].values())})
+                         "listing_only": count(main), "paper": list(PAPER["counts"].values())})
 
 
 def table_1(obs):
@@ -128,7 +128,7 @@ def regressions(obs):
     for q in range(1, 6):
         add("6", f"volume quintile {q}", closing.filter(pl.col("volume_q") == q), PAPER["table_6_psi"][q - 1], cluster_by=event)
         add("7", f"trade size quintile {q}", closing.filter(pl.col("size_q") == q), PAPER["table_7_psi"][q - 1], cluster_by=event)
-    for category, psi in PAPER["table_8_psi"].items():
+    for category, psi in {**PAPER["table_8_psi"], "Sports": None}.items():
         add("8", category, yes.filter(pl.col("paper_category") == category), psi)
     for year in sorted(yes["year"].unique()):
         add("9", year, yes.filter(pl.col("year") == year), PAPER["table_9_psi"].get(year))

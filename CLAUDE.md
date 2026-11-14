@@ -49,6 +49,8 @@ buying (85–97c favourites, interest carry on cash). The full plan is in [PLAN.
 - `download_data.py oos` (overnight): remaining out-of-sample trades, then the daily (>= 24h) markets inside
   hourly/15-minute non-sports series for May 2025 to Oct 2026, with their candles and trades, under `data/oos_extra/`
   (candles and trades in 500-market chunks: `{series}__{i}.parquet`).
+- `download_data.py oos-sports` (Jordan, 2026-11-13): same method for all 4,271 sports series, May 2025 to
+  Oct 2026, under `data/oos_sports/`. 15 to 40 hours; resumable. Read by `sample.py` through the combined tables.
 - Skip multivariate combo series (tickers starting `KXMVE`); they dominate the raw listing. `mve_filter`
   cannot be combined with `series_ticker`.
 - Usable history starts July 2021. Prices come as dollar strings (`*_dollars`), volumes as `*_fp` strings.
@@ -58,6 +60,12 @@ buying (85–97c favourites, interest carry on cash). The full plan is in [PLAN.
   (`data/trades/{series}__{paper|oos}.parquet`), with no combined file; read them lazily with `pl.scan_parquet`.
 - Trades have their own archive cutoff: a live market can have older trades in `/historical/trades`, so live
   markets query both trade endpoints.
+- **One set of tables (Jordan, 2026-11-14).** `download_data.py combine` merges every source into
+  `data/markets.parquet` and `data/candles.parquet`, with `source` (listing, paper_extra, oos_extra, oos_sports),
+  `category`, `series_frequency` and `hourly_series`. All trades are in `data/trades/`, named
+  `{series}__{period}[__chunk].parquet` (`paper_extra__paper.parquet` mixes series). The raw listing is
+  `data/listing_markets.parquet` / `listing_candles.parquet`; the per-source folders under `data/` only hold
+  download caches. What goes into the sample is set in `config.py`: `INCLUDE_SPORTS`, `INCLUDE_HOURLY_SERIES`.
 
 ## Secrets
 

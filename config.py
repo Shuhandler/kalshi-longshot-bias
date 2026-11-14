@@ -16,8 +16,10 @@ PAPER_END = dt.datetime(2025, 5, 1, tzinfo=dt.timezone.utc)     # paper sample e
 OOS_END = dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc)      # out of sample: May 2025 to 31 Oct 2026
 PERIODS = {"paper": (PAPER_START, PAPER_END), "oos": (PAPER_END, OOS_END)}
 
-# --- Extra markets the series listing skips (sports, and daily markets inside "hourly" series) ---
-INCLUDE_EXTRA = True        # data/paper_extra and data/oos_extra from download_data.py
+# --- What to include (data/markets.parquet holds everything; these choose what goes into the sample) ---
+INCLUDE_SPORTS = True           # the Sports category (in the paper's sample from January 2025)
+INCLUDE_HOURLY_SERIES = True    # daily markets inside series Kalshi tags hourly or 15-minute (crypto, indices);
+                                # the paper keeps them because it filters on time open, not on series
 
 # --- Paper sample filters (Bürgi, Deng and Whelan, section 3.1) ---
 MIN_VOLUME_DOLLARS = 1_000  # Kalshi reports volume in contracts, each with $1 notional
@@ -41,7 +43,7 @@ PRICE_RANGES = ["1c-10c", "11c-20c", "21c-30c", "31c-40c", "41c-50c",
 # --- Paper categories (Table 8). Kalshi's Elections counts as Politics; the rest is Other. ---
 PAPER_CATEGORY = {"Financials": "Financials", "Climate and Weather": "Climate & Weather", "Crypto": "Crypto",
                   "Politics": "Politics", "Elections": "Politics", "Entertainment": "Entertainment",
-                  "Economics": "Economics"}
+                  "Economics": "Economics", "Sports": "Sports"}   # Sports is its own group (the paper's Other)
 NUMERICAL_STRIKES = ["greater", "greater_or_equal", "less", "less_or_equal", "between"]
 
 # --- The paper's published numbers, for comparison (January 2026 version) ---

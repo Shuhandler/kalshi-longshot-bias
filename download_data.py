@@ -1,15 +1,19 @@
 """
-Download the Kalshi data used by kalshi_longshot.ipynb.
+Download the Kalshi data used by sample.py and replicate.py.
 
     .venv/bin/python download_data.py          # series, market listing and daily candles
     .venv/bin/python download_data.py trades   # trades for the sample in data/trade_tickers.parquet
     .venv/bin/python download_data.py paper-extra   # sports and daily crypto/index markets up to April 2025
     .venv/bin/python download_data.py events   # event details (mutually exclusive or not) for the sample
     .venv/bin/python download_data.py oos      # overnight: OOS trades, then daily markets in "hourly" series
+    .venv/bin/python download_data.py oos-sports   # sports markets, candles and trades, May 2025 to Oct 2026
+    .venv/bin/python download_data.py combine  # merge every source into data/markets.parquet and data/candles.parquet
 
 Everything is cached under data/ (git-ignored), one Parquet file per series, so a run that stops
-can be restarted and skips what is already on disk. The first command also writes two combined files
-for the notebook: data/markets.parquet and data/candles.parquet. Trades stay one file per series.
+can be restarted and skips what is already on disk. The market listing is saved as
+data/listing_markets.parquet and data/listing_candles.parquet. `combine` then merges the listing with the
+extra markets (paper_extra, oos_extra, oos_sports) into data/markets.parquet and data/candles.parquet,
+with a `source` column. Trades from every source sit in data/trades/, one file per series and period.
 
 Kalshi splits its data in two. Markets that settled before the historical cutoff are only under
 /historical/...; newer ones are on the live endpoints. Each function reads both. Historical markets
@@ -237,8 +241,8 @@ def download_markets():
 
     markets = pl.concat([pl.read_parquet(DATA / "markets" / f"{t}.parquet") for t in keep], how="diagonal_relaxed")
     markets = markets.unique("ticker", keep="first")      # a market can be in both the archive and the live listing
-    markets.write_parquet(DATA / "markets.parquet")
-    print(f"{len(markets):,} settled markets -> data/markets.parquet")
+    markets.write_parquet(DATA / "listing_markets.parquet")
+    print(f"{len(markets):,} settled markets -> data/listing_markets.parquet")
     return markets
 
 
@@ -273,8 +277,8 @@ def download_candles(markets):
             print(f"{i:,} of {len(groups):,} series done, {(time.time() - start) / 60:.0f} min")
 
     candles = combine("candles")
-    candles.write_parquet(DATA / "candles.parquet")
-    print(f"{len(candles):,} daily candles for {candles['ticker'].n_unique():,} markets -> data/candles.parquet")
+    candles.write_parquet(DATA / "listing_candles.parquet")
+    print(f"{len(candles):,} daily candles for {candles['ticker'].n_unique():,} markets -> data/listing_candles.parquet")
 
 
 def download_trades():
@@ -284,7 +288,7 @@ def download_trades():
     history is too large to hold in memory, so the notebook reads these files lazily.
     """
     sample = pl.read_parquet(DATA / "trade_tickers.parquet")              # columns: ticker, period
-    markets = pl.read_parquet(DATA / "markets.parquet").join(sample, on="ticker")
+    markets = pl.read_parquet(DATA / "listing_markets.parquet").join(sample, on="ticker")
     for period in ["paper", "oos"]:
         groups = sorted(markets.filter(pl.col("period") == period).partition_by("series_ticker", as_dict=True).items())
         n_markets = sum(len(g) for _, g in groups)
@@ -331,7 +335,7 @@ def download_paper_extra():
 
     # 2. Traded markets our listing does not have, apart from multivariate combos.
     #    A market ticker starts with its series ticker (KXBTCD-25JAN1717-T100000).
-    listed = pl.read_parquet(DATA / "markets.parquet", columns=["ticker"])["ticker"]
+    listed = pl.read_parquet(DATA / "listing_markets.parquet", columns=["ticker"])["ticker"]
     all_trades = combine("paper_extra/trades_by_day").unique()     # a trade on a midnight boundary is in two days
     extra_trades = all_trades.filter(~pl.col("ticker").is_in(listed.implode()) & ~pl.col("ticker").str.starts_with("KXMVE"))
     tickers = extra_trades["ticker"].unique().sort().to_list()
@@ -352,7 +356,7 @@ def download_paper_extra():
     print(f"{len(markets):,} extra markets closing before May 2025 -> {path}")
 
     # 4. Their trades, and daily candles for those that pass the loose pre-filter
-    extra_trades.filter(pl.col("ticker").is_in(markets["ticker"].implode())).write_parquet(EXTRA / "trades.parquet")
+    extra_trades.filter(pl.col("ticker").is_in(markets["ticker"].implode())).write_parquet(DATA / "trades" / "paper_extra__paper.parquet")
     wanted = candle_markets(markets)
     path = EXTRA / "candles.parquet"
     if not path.exists():
@@ -380,9 +384,9 @@ def could_pass(m):
             and close - opened >= dt.timedelta(hours=MIN_HOURS_OPEN))
 
 
-def pull_oos_extra_series(series_ticker):
-    """Markets in one hourly series that could pass the filters, with their candles and trades."""
-    path = OOS_EXTRA / "markets" / f"{series_ticker}.parquet"
+def pull_oos_extra_series(series_ticker, out=OOS_EXTRA):
+    """Markets in one series that could pass the filters, with their candles and trades, saved under `out`."""
+    path = out / "markets" / f"{series_ticker}.parquet"
     if path.exists():
         return
     rows = []
@@ -401,14 +405,14 @@ def pull_oos_extra_series(series_ticker):
         with ThreadPoolExecutor(WORKERS) as pool:
             candles = [r for rs in pool.map(lambda m: candles_for_market(series_ticker, m), chunk.iter_rows(named=True)) for r in rs]
             trades = [t for market_trades in pool.map(trades_for_market, chunk.iter_rows(named=True)) for t in market_trades]
-        to_text_table(candles).write_parquet(OOS_EXTRA / "candles" / f"{series_ticker}__{i}.parquet")
-        to_text_table(trades).write_parquet(OOS_EXTRA / "trades" / f"{series_ticker}__{i}.parquet")
+        to_text_table(candles).write_parquet(out / "candles" / f"{series_ticker}__{i}.parquet")
+        to_text_table(trades).write_parquet(DATA / "trades" / f"{series_ticker}__oos__{i}.parquet")
     markets.write_parquet(path)        # written last, so an interrupted series is redone on restart
 
 
 def download_oos_extra():
     """Every non-sports hourly or 15-minute series; files under data/oos_extra/."""
-    for folder in ["markets", "candles", "trades"]:
+    for folder in ["markets", "candles"]:
         (OOS_EXTRA / folder).mkdir(parents=True, exist_ok=True)
     series = pull_series().filter(
         pl.col("frequency").is_in(list(SKIP_FREQUENCIES))
@@ -422,6 +426,27 @@ def download_oos_extra():
         print(f"  {i} of {len(series)} series done ({ticker}), {(time.time() - start) / 60:.0f} min")
 
 
+# --- Sports, out of sample (Jordan, 2026-11-13) ---
+# Same method as the hourly series above, for every sports series, May 2025 to October 2026.
+OOS_SPORTS = DATA / "oos_sports"
+
+
+def download_oos_sports():
+    """Every sports series; files under data/oos_sports/. Long: expect 15 to 40 hours. Safe to stop and rerun."""
+    for folder in ["markets", "candles"]:
+        (OOS_SPORTS / folder).mkdir(parents=True, exist_ok=True)
+    series = pull_series().filter(
+        (pl.col("category") == "Sports") & ~pl.col("ticker").str.starts_with("KXMVE")
+    )["ticker"].to_list()
+    print(f"Sports series: {len(series):,}")
+    start = time.time()
+    for i, ticker in enumerate(series, 1):
+        pull_oos_extra_series(ticker, out=OOS_SPORTS)
+        if i % 50 == 0:
+            done = time.time() - start
+            print(f"  {i:,} of {len(series):,} series done, {done / 3600:.1f} h so far")
+
+
 # --- Event details for the sample (paper Table 4 needs to know if an event is mutually exclusive) ---
 EVENT_COLUMNS = ["event_ticker", "series_ticker", "title", "category", "mutually_exclusive"]
 
@@ -433,21 +458,66 @@ def event_details(event_ticker):
 
 
 def download_events():
-    """Details for every event in data/trade_tickers.parquet, saved as data/events.parquet."""
+    """Details for every event in data/trade_tickers.parquet, added to data/events.parquet.
+
+    Events already in the file are skipped. New events are fetched a series at a time (200 per request),
+    then any left over (e.g. old tickers filed under a renamed series) one at a time.
+    """
     path = DATA / "events.parquet"
-    if path.exists():
-        return
+    have = pl.read_parquet(path) if path.exists() else pl.DataFrame(schema={c: pl.String for c in EVENT_COLUMNS})
     sample = pl.read_parquet(DATA / "trade_tickers.parquet")
-    markets = pl.read_parquet(DATA / "markets.parquet", columns=["ticker", "event_ticker"])
-    extra = EXTRA / "markets.parquet"
-    if extra.exists():
-        markets = pl.concat([markets, pl.read_parquet(extra, columns=["ticker", "event_ticker"])])
-    events = markets.join(sample, on="ticker")["event_ticker"].unique().sort().to_list()
-    print(f"Details for {len(events):,} events")
+    wanted = (pl.read_parquet(DATA / "markets.parquet", columns=["ticker", "event_ticker", "series_ticker"])
+              .join(sample, on="ticker").select("event_ticker", "series_ticker").unique("event_ticker")
+              .filter(~pl.col("event_ticker").is_in(have["event_ticker"].implode())))
+    print(f"Details for {len(wanted):,} new events in {wanted['series_ticker'].n_unique():,} series")
+    needed = set(wanted["event_ticker"])
+
+    def by_series(series_ticker):
+        return [{k: e.get(k) for k in EVENT_COLUMNS} for e in get_all("/events", "events", series_ticker=series_ticker, limit=200)
+                if e.get("event_ticker") in needed]
+
     with ThreadPoolExecutor(WORKERS) as pool:
-        rows = list(pool.map(event_details, events))
-    to_text_table(rows).write_parquet(path)
+        rows = [r for rs in pool.map(by_series, wanted["series_ticker"].unique().to_list()) for r in rs]
+        left = sorted(needed - {r["event_ticker"] for r in rows})
+        print(f"{len(rows):,} found by series, {len(left):,} fetched one at a time")
+        rows += list(pool.map(event_details, left))
+    pl.concat([have, to_text_table(rows)], how="diagonal_relaxed").unique("event_ticker").write_parquet(path)
     print(f"-> {path}")
+
+
+# --- One set of tables from every source (Jordan, 2026-11-14) ---
+def combine():
+    """Merge the listing and the extra markets into data/markets.parquet and data/candles.parquet.
+
+    `source` says where each market came from: listing, paper_extra, oos_extra or oos_sports.
+    `series_frequency` comes from the series list, matched on the series ticker.
+    `hourly_series` marks markets the listing skipped because Kalshi tags their series hourly or 15-minute
+    (the daily crypto and index markets), so the analysis can include or exclude them.
+    """
+    def folder(name):
+        files = [f for f in sorted((DATA / name).glob("*.parquet")) if pl.read_parquet_schema(f)]
+        return pl.concat([pl.read_parquet(f) for f in files], how="diagonal_relaxed")
+
+    sources = {
+        "listing": (pl.read_parquet(DATA / "listing_markets.parquet"), pl.read_parquet(DATA / "listing_candles.parquet")),
+        "paper_extra": (pl.read_parquet(EXTRA / "markets.parquet"), pl.read_parquet(EXTRA / "candles.parquet")),
+        "oos_extra": (folder("oos_extra/markets"), folder("oos_extra/candles")),
+        "oos_sports": (folder("oos_sports/markets"), folder("oos_sports/candles")),
+    }
+    series = pull_series().select(pl.col("ticker").alias("series_ticker"), "category", pl.col("frequency").alias("series_frequency"))
+    markets = (
+        pl.concat([m.with_columns(pl.lit(name).alias("source")) for name, (m, _) in sources.items()], how="diagonal_relaxed")
+        .unique("ticker", keep="first", maintain_order=True)
+        .join(series, on="series_ticker", how="left")
+        .with_columns(((pl.col("source") == "oos_extra")
+                       | ((pl.col("source") == "paper_extra") & (pl.col("category") != "Sports").fill_null(True))
+                       | pl.col("series_frequency").is_in(list(SKIP_FREQUENCIES))).alias("hourly_series"))
+    )
+    candles = pl.concat([c for _, c in sources.values()], how="diagonal_relaxed").unique(["ticker", "end_period_ts"])
+    markets.write_parquet(DATA / "markets.parquet")
+    candles.write_parquet(DATA / "candles.parquet")
+    print(markets.group_by("source").len().sort("source"))
+    print(f"{len(markets):,} markets -> data/markets.parquet; {len(candles):,} candles -> data/candles.parquet")
 
 
 if __name__ == "__main__":
@@ -460,9 +530,15 @@ if __name__ == "__main__":
         download_paper_extra()
     elif sys.argv[1:] == ["events"]:
         download_events()
+    elif sys.argv[1:] == ["combine"]:
+        combine()
+    elif sys.argv[1:] == ["oos-sports"]:
+        download_oos_sports()
+        print("All out-of-sample sports downloads finished.")
     elif sys.argv[1:] == ["oos"]:
         download_trades()
         download_oos_extra()
         print("All out-of-sample downloads finished.")
     else:
         download_candles(download_markets())
+        combine()

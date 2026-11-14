@@ -4,7 +4,8 @@ Build the paper's sample and its price observations from the files in data/.
     .venv/bin/python sample.py
 
 Steps (Bürgi, Deng and Whelan, section 3.1):
-1. Load markets and daily candles, including the extra markets in data/paper_extra and data/oos_extra.
+1. Load markets and daily candles (data/markets.parquet and data/candles.parquet from download_data.py),
+   keeping sports and the daily markets inside "hourly" series if config.py says so.
 2. Apply the paper's filters: settled Yes or No, at least $1,000 volume, open at least 24 hours,
    final bid-ask spread of 20c or less.
 3. Price snapshots from the trades: the last trade, and the price as of exactly 1 to 10 days
@@ -17,44 +18,33 @@ and data/trade_tickers.parquet, which `download_data.py trades` reads.
 """
 import polars as pl
 
-from config import (DATA, PERIODS, INCLUDE_EXTRA, MIN_VOLUME_DOLLARS, MAX_FINAL_SPREAD, MIN_HOURS_OPEN,
+from config import (DATA, PERIODS, INCLUDE_SPORTS, INCLUDE_HOURLY_SERIES, MIN_VOLUME_DOLLARS, MAX_FINAL_SPREAD, MIN_HOURS_OPEN,
                     SNAPSHOT_DAYS, NUMERICAL_STRIKES)
 from stats import price_range
 
 
-def read_folder(folder):
-    """Stack every non-empty Parquet file in a folder."""
-    files = [f for f in sorted(folder.glob("*.parquet")) if pl.read_parquet_schema(f)]
-    return pl.concat([pl.read_parquet(f) for f in files], how="diagonal_relaxed")
-
-
 def load_markets_and_candles():
-    """Markets (one row each, typed) and daily candles, with the extra markets added when INCLUDE_EXTRA is on."""
-    markets = pl.read_parquet(DATA / "markets.parquet").with_columns(pl.lit(False).alias("extra"))
-    candles = pl.read_parquet(DATA / "candles.parquet")
-    if INCLUDE_EXTRA:
-        extra_markets = [pl.read_parquet(DATA / "paper_extra" / "markets.parquet"), read_folder(DATA / "oos_extra" / "markets")]
-        extra_candles = [pl.read_parquet(DATA / "paper_extra" / "candles.parquet"), read_folder(DATA / "oos_extra" / "candles")]
-        markets = pl.concat([markets, *[m.with_columns(pl.lit(True).alias("extra")) for m in extra_markets]], how="diagonal_relaxed")
-        candles = pl.concat([candles, *extra_candles], how="diagonal_relaxed")
-    markets = markets.unique("ticker", keep="first")
-
-    series = pl.read_parquet(DATA / "series.parquet").select(pl.col("ticker").alias("series_ticker"), "category")
+    """Markets (one row each, typed) and daily candles, filtered by INCLUDE_SPORTS and INCLUDE_HOURLY_SERIES."""
     events = pl.read_parquet(DATA / "events.parquet").select(
         "event_ticker", (pl.col("mutually_exclusive") == "True").alias("mutually_exclusive"),
         pl.col("category").alias("event_category"))
     markets = (
-        markets
-        .select("ticker", "event_ticker", "series_ticker", "market_type", "strike_type", "result", "extra",
+        pl.read_parquet(DATA / "markets.parquet")
+        .select("ticker", "event_ticker", "series_ticker", "market_type", "strike_type", "result", "source", "category",
+                "hourly_series",
                 pl.col("volume_fp").cast(pl.Float64).alias("volume"),
                 pl.col("last_price_dollars").cast(pl.Float64).alias("reported_last_price"),
                 pl.col("open_time").str.to_datetime(time_zone="UTC").alias("open"),
                 pl.col("close_time").str.to_datetime(time_zone="UTC").alias("close"))
-        .join(series, on="series_ticker", how="left")
         .join(events, on="event_ticker", how="left")
-        .with_columns(pl.coalesce("category", "event_category").alias("category"))
+        .with_columns(pl.coalesce("category", "event_category").alias("category"))   # series not in Kalshi's list
         .drop("event_category")
     )
+    if not INCLUDE_SPORTS:
+        markets = markets.filter(pl.col("category") != "Sports")
+    if not INCLUDE_HOURLY_SERIES:
+        markets = markets.filter(~pl.col("hourly_series"))
+    candles = pl.read_parquet(DATA / "candles.parquet").filter(pl.col("ticker").is_in(markets["ticker"].implode()))
     return markets, candles
 
 
@@ -82,6 +72,7 @@ def contract_types(markets):
         markets.join(per_event, on="event_ticker")
         .select("ticker",
                 pl.when(pl.col("contracts_in_event") == 1).then(pl.lit("Single"))
+                  .when(pl.col("mutually_exclusive").is_null()).then(pl.lit("Unknown"))     # event details not downloaded
                   .when(~pl.col("mutually_exclusive")).then(pl.lit("Non-exclusive"))
                   .when(pl.col("strike_type").is_in(NUMERICAL_STRIKES)).then(pl.lit("Exclusive numerical"))
                   .otherwise(pl.lit("Exclusive other")).alias("contract_type"))
@@ -108,17 +99,18 @@ def build_sample(markets, candles):
     )
 
 
-def trade_files(period):
-    """The trade files for one period: one per series (and chunk), plus the extra markets."""
-    files = sorted((DATA / "trades").glob(f"*__{period}.parquet"))
-    if INCLUDE_EXTRA:
-        files += [DATA / "paper_extra" / "trades.parquet"] if period == "paper" else sorted((DATA / "oos_extra" / "trades").glob("*.parquet"))
+def trade_files(period, series):
+    """Trade files for one period, keeping only series in the sample. Files are named {series}__{period}[__chunk];
+    paper_extra__paper.parquet mixes many series (the markets added for the paper period)."""
+    files = sorted((DATA / "trades").glob(f"*__{period}*.parquet"))
+    files = [f for f in files if f.name.split("__")[0] in series or f.name.startswith("paper_extra__")]
     return [f for f in files if pl.read_parquet_schema(f)]
 
 
 def snapshots_from_trades(raw):
     """Price snapshots for the markets in one trade file, plus each market's average trade size in dollars."""
-    trades = raw.select(
+    # A market listed in both the archive and the live endpoint had its trades downloaded twice; drop exact repeats
+    trades = raw.unique().select(
         "ticker",
         pl.col("created_time").str.to_datetime(time_zone="UTC", format="%Y-%m-%dT%H:%M:%S%.fZ").alias("time"),
         pl.col("yes_price_dollars").cast(pl.Float64).alias("yes_price"),
@@ -154,7 +146,7 @@ def build_observations(sample, period):
     in_period = sample.filter(pl.col("period") == period)
     tickers = in_period["ticker"].implode()
     snapshots = pl.concat([snapshots_from_trades(pl.read_parquet(f).filter(pl.col("ticker").is_in(tickers)))
-                           for f in trade_files(period)])
+                           for f in trade_files(period, set(in_period["series_ticker"]))])
     snapshots = snapshots.join(in_period.drop("period"), on="ticker")
 
     # The paper dropped 63 contracts whose last trade did not match Kalshi's reported last price (footnote 2)

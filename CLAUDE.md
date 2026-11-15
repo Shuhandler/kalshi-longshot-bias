@@ -75,3 +75,19 @@ buying (85–97c favourites, interest carry on cash). The full plan is in [PLAN.
 ## Sources
 
 - Never write a citation or a figure from memory. Check it against the paper PDF or the Kalshi docs.
+
+## Review fixes (REVIEW.md, 2026-11-14)
+
+- Trades keep `trade_id`; de-duplicate on it only. Downloads read the live endpoint before the archive and
+  drop repeated tickers before chunking. Skipped requests are logged to `data/skipped.csv`.
+- Markets that were listed twice in `oos_extra`/`oos_sports` had their trades re-downloaded once into
+  `data/trades/{series}__oos__repair.parquet` and removed from the other chunk files. `sample.py` asserts that
+  each (ticker, days_before) snapshot is unique.
+- Fees: paper period uses the paper's flat 0.07 taker fee; out of sample uses the fee in force on each date
+  (`download_data.py fees` -> `data/fee_changes.parquet`) and a 0.0175 maker fee on maker-fee series.
+- Interest: no rate history exists; report results at 0% and 3.5% (`config.INTEREST_RATES`).
+- `close` is the final close and leaks the outcome for early-closing markets; so does `expected_expiration`
+  (a value on today's record). Use `scheduled_close`, the end of the day written in the event ticker (fixed
+  at listing; null when the ticker has no full date), for any strategy timing. `replicate.py` writes the
+  leakage check to `results/{period}/early_close.csv`.
+- Confidence intervals in `stats.mean_with_ci` are clustered by event.

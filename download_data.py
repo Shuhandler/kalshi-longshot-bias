@@ -8,6 +8,7 @@ Download the Kalshi data used by sample.py and replicate.py.
     .venv/bin/python download_data.py oos      # overnight: OOS trades, then daily markets in "hourly" series
     .venv/bin/python download_data.py oos-sports   # sports markets, candles and trades, May 2025 to Oct 2026
     .venv/bin/python download_data.py combine  # merge every source into data/markets.parquet and data/candles.parquet
+    .venv/bin/python download_data.py fees     # history of series fee changes -> data/fee_changes.parquet
 
 Everything is cached under data/ (git-ignored), one Parquet file per series, so a run that stops
 can be restarted and skips what is already on disk. The market listing is saved as
@@ -19,7 +20,7 @@ Kalshi splits its data in two. Markets that settled before the historical cutoff
 /historical/...; newer ones are on the live endpoints. Each function reads both. Historical markets
 can only be filtered by series, so the listing loops over every series.
 
-Values are stored as text exactly as the API returns them; the notebook converts them to numbers.
+Values are stored as text exactly as the API returns them; sample.py converts them to numbers.
 Run from Jordan's Mac: the Kalshi API cannot be reached from the cloud environment.
 """
 import base64
@@ -97,6 +98,8 @@ def get(path, **params):
             return r.json()
         if r.status_code in (400, 404):    # e.g. a ticker containing "%", which the API cannot read
             print(f"Skipped {path}: {r.status_code}")
+            with open(DATA / "skipped.csv", "a") as log:       # kept so skipped requests can be counted
+                log.write(f"{dt.datetime.now(dt.timezone.utc).isoformat()},{r.status_code},{path},{params}\n")
             return {}
         if r.status_code == 429 or r.status_code >= 500:
             time.sleep(2 ** attempt)
@@ -127,7 +130,7 @@ def ts(text):
     return int(dt.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
 
 
-def combine(folder):
+def stack_folder(folder):
     """Stack every per-series file in a cache folder into one table."""
     files = sorted((DATA / folder).glob("*.parquet"))
     return pl.concat([pl.read_parquet(f) for f in files], how="diagonal_relaxed")
@@ -150,12 +153,14 @@ def pull_markets(series_ticker):
     path = DATA / "markets" / f"{series_ticker}.parquet"
     if not path.exists():
         rows = []
-        for source, endpoint, extra in [("historical", "/historical/markets", {}),
-                                        ("live", "/markets", {"status": "settled"})]:
+        # Live first, then the archive: records move from live to archive, so this order can only produce
+        # duplicates (dropped below), never gaps. Kalshi's Historical Data guide pages them the same way.
+        for source, endpoint, extra in [("live", "/markets", {"status": "settled"}),
+                                        ("historical", "/historical/markets", {})]:
             for m in get_all(endpoint, "markets", series_ticker=series_ticker, limit=1000, **extra):
                 rows.append({k: v for k, v in m.items() if k not in MARKET_DROP}
                             | {"series_ticker": series_ticker, "source": source})
-        to_text_table(rows).write_parquet(path)
+        to_text_table(rows).unique("ticker", keep="first", maintain_order=True).write_parquet(path)
     return pl.read_parquet(path)
 
 
@@ -196,18 +201,17 @@ def pull_candles(series_ticker, markets):
     return pl.read_parquet(path)
 
 
-TRADE_COLUMNS = ["ticker", "created_time", "yes_price_dollars", "count_fp", "taker_outcome_side", "is_block_trade"]
+TRADE_COLUMNS = ["trade_id", "ticker", "created_time", "yes_price_dollars", "count_fp", "taker_outcome_side", "is_block_trade"]
 
 
 def trades_for_market(m):
-    """Every trade for one market, keeping only the columns the notebook uses.
+    """Every trade for one market, keeping only the columns the analysis uses.
 
     Trades have their own archive cutoff, so a market that settled recently can still have its older
     trades in the archive. Archived markets need only the archive; live markets need both.
     """
-    trades = get_all("/historical/trades", "trades", ticker=m["ticker"], limit=1000)
-    if m["source"] == "live":
-        trades += get_all("/markets/trades", "trades", ticker=m["ticker"], limit=1000)
+    trades = get_all("/markets/trades", "trades", ticker=m["ticker"], limit=1000) if m["source"] == "live" else []
+    trades += get_all("/historical/trades", "trades", ticker=m["ticker"], limit=1000)   # live first, then archive
     unique = {t["trade_id"]: t for t in trades}.values()      # a trade could be in both while it moves
     return [{k: t.get(k) for k in TRADE_COLUMNS} for t in unique]
 
@@ -247,7 +251,7 @@ def download_markets():
 
 
 def candle_markets(markets):
-    """Loose pre-filter for the candle download. The paper's exact filters are applied in the notebook."""
+    """Loose pre-filter for the candle download. The paper's exact filters are applied in sample.py."""
     return (
         markets
         .with_columns(
@@ -276,16 +280,16 @@ def download_candles(markets):
         if i % 200 == 0:
             print(f"{i:,} of {len(groups):,} series done, {(time.time() - start) / 60:.0f} min")
 
-    candles = combine("candles")
+    candles = stack_folder("candles")
     candles.write_parquet(DATA / "listing_candles.parquet")
     print(f"{len(candles):,} daily candles for {candles['ticker'].n_unique():,} markets -> data/listing_candles.parquet")
 
 
 def download_trades():
-    """Trades for the sample the notebook saved to data/trade_tickers.parquet, paper period first.
+    """Trades for the sample sample.py saved to data/trade_tickers.parquet, paper period first.
 
     One file per series and period under data/trades/. There is no combined file: the full trade
-    history is too large to hold in memory, so the notebook reads these files lazily.
+    history is too large to hold in memory, so sample.py reads them one file at a time.
     """
     sample = pl.read_parquet(DATA / "trade_tickers.parquet")              # columns: ticker, period
     markets = pl.read_parquet(DATA / "listing_markets.parquet").join(sample, on="ticker")
@@ -305,7 +309,7 @@ def download_trades():
 # any market open at least 24 hours, and many markets in "hourly" crypto and index series (KXBTCD, INXU,
 # ...) are daily markets. Before May 2025 the whole exchange traded little, so the quickest way to find
 # these markets is to download every trade by day, take the traded tickers our listing does not have,
-# and look those markets up by ticker. The 24-hour rule is applied in the notebook, so markets that
+# and look those markets up by ticker. The 24-hour rule is applied in sample.py, so markets that
 # really are hourly stay out of the sample.
 EXTRA = DATA / "paper_extra"
 EXTRA_START = dt.date(2021, 6, 30)
@@ -336,7 +340,7 @@ def download_paper_extra():
     # 2. Traded markets our listing does not have, apart from multivariate combos.
     #    A market ticker starts with its series ticker (KXBTCD-25JAN1717-T100000).
     listed = pl.read_parquet(DATA / "listing_markets.parquet", columns=["ticker"])["ticker"]
-    all_trades = combine("paper_extra/trades_by_day").unique()     # a trade on a midnight boundary is in two days
+    all_trades = stack_folder("paper_extra/trades_by_day").unique("trade_id")   # a trade on a midnight boundary is in two days
     extra_trades = all_trades.filter(~pl.col("ticker").is_in(listed.implode()) & ~pl.col("ticker").str.starts_with("KXMVE"))
     tickers = extra_trades["ticker"].unique().sort().to_list()
     print(f"{len(all_trades):,} trades on the exchange; {len(extra_trades):,} in {len(tickers):,} markets not in our listing")
@@ -390,7 +394,7 @@ def pull_oos_extra_series(series_ticker, out=OOS_EXTRA):
     if path.exists():
         return
     rows = []
-    for source, endpoint, extra in [("historical", "/historical/markets", {}), ("live", "/markets", {"status": "settled"})]:
+    for source, endpoint, extra in [("live", "/markets", {"status": "settled"}), ("historical", "/historical/markets", {})]:
         cursor = None
         while True:
             page = get(endpoint, series_ticker=series_ticker, limit=1000, cursor=cursor, **extra)
@@ -400,6 +404,8 @@ def pull_oos_extra_series(series_ticker, out=OOS_EXTRA):
             if not cursor:
                 break
     markets = to_text_table(rows)
+    if len(markets):
+        markets = markets.unique("ticker", keep="first", maintain_order=True)   # listed both live and archived
     # Candles and trades in chunks of 500 markets, so a big series (millions of trades) never sits in memory at once
     for i, chunk in enumerate(markets.iter_slices(500)):
         with ThreadPoolExecutor(WORKERS) as pool:
@@ -485,6 +491,15 @@ def download_events():
     print(f"-> {path}")
 
 
+# --- Fee history (REVIEW.md M1) ---
+def download_fee_changes():
+    """Every recorded change to a series' fee type or multiplier -> data/fee_changes.parquet.
+    Kalshi's history starts in October 2025; earlier settings are not published."""
+    changes = get("/series/fee_changes", show_historical="true").get("series_fee_change_arr", [])
+    to_text_table(changes).write_parquet(DATA / "fee_changes.parquet")
+    print(f"{len(changes):,} fee changes -> data/fee_changes.parquet")
+
+
 # --- One set of tables from every source (Jordan, 2026-11-14) ---
 def combine():
     """Merge the listing and the extra markets into data/markets.parquet and data/candles.parquet.
@@ -530,6 +545,8 @@ if __name__ == "__main__":
         download_paper_extra()
     elif sys.argv[1:] == ["events"]:
         download_events()
+    elif sys.argv[1:] == ["fees"]:
+        download_fee_changes()
     elif sys.argv[1:] == ["combine"]:
         combine()
     elif sys.argv[1:] == ["oos-sports"]:

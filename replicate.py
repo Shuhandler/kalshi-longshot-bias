@@ -10,9 +10,14 @@ as PNG to results/{period}/, and prints them with the paper's numbers alongside.
 Definitions (paper sections 3.2 to 4):
 - Y is 1 if the contract won, P the price paid in dollars.
 - Pre-fee return: (Y - P) / P.
-- Post-fee return for Takers (equation 2): the fee C is added to the cost, (Y - P - C) / (P + C).
-  Makers paid no fees in the paper's sample; we apply the same rule out of sample so the code is unchanged.
+- Post-fee return (equation 2): the fee C is added to the cost, (Y - P - C) / (P + C).
+- Fees. Paper period: the paper's flat taker fee (0.07), makers free. Out of sample: the fee in force on the
+  snapshot date for that series (multiplier and fee type from data/fee_changes.parquet, falling back to the
+  series' current settings), and maker fees (0.0175) on series that charge them (REVIEW.md M1).
 - Each snapshot trade had a Taker on one side and a Maker on the other, so half the observations are each.
+  On Kalshi a Taker selling Yes is recorded as buying No; for returns this is the same trade.
+- The closing-day price is often set after the outcome is all but known (REVIEW.md H3), so the main return
+  tables are also shown for 1 to 10 days before the last trade only (suffix _days_1_10).
 """
 import argparse
 
@@ -21,27 +26,59 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import polars as pl
 
-from config import DATA, RESULTS, PAPER, PRICE_RANGES, PAPER_CATEGORY, SNAPSHOT_DAYS
-from stats import taker_fee_per_contract, mean_with_ci, mincer_zarnowitz
+from config import (DATA, RESULTS, PAPER, PRICE_RANGES, PAPER_CATEGORY, SNAPSHOT_DAYS, TAKER_FEE_RATE, MAKER_FEE_RATE,
+                    MAKER_FEES_START, PAPER_FLAT_FEES, FAVOURITE_MIN, FAVOURITE_MAX)
+from stats import fee_per_contract, mean_with_ci, mincer_zarnowitz
 
 RANGE_ORDER = pl.DataFrame({"price_range": PRICE_RANGES, "order": range(len(PRICE_RANGES))})
 
 
-def load(period):
-    """Observations with returns, paper categories and year added."""
-    won = pl.col("won").cast(pl.Float64)
+def fees_in_force(obs):
+    """Each observation's series fee multiplier and fee type on its snapshot date.
+    Kalshi publishes fee changes from October 2025 on: before a series' first change we assume the standard
+    taker-only fee (multiplier 1); series that never changed keep their current settings."""
+    changes = (pl.read_parquet(DATA / "fee_changes.parquet")
+               .select("series_ticker", pl.col("scheduled_ts").str.to_datetime(time_zone="UTC").alias("changed"),
+                       pl.col("fee_multiplier").cast(pl.Float64).alias("changed_multiplier"),
+                       pl.col("fee_type").alias("changed_type"))
+               .sort("changed"))
+    current = (pl.read_parquet(DATA / "series.parquet")
+               .select(pl.col("ticker").alias("series_ticker"), pl.col("fee_multiplier").cast(pl.Float64).alias("current_multiplier"),
+                       pl.col("fee_type").alias("current_type")))
+    has_changes = changes.select("series_ticker").unique().with_columns(pl.lit(True).alias("has_changes"))
     return (
-        pl.read_parquet(DATA / f"observations_{period}.parquet")
-        .with_columns(taker_fee_per_contract(pl.col("price")).alias("fee"),
-                      pl.col("category").replace_strict(PAPER_CATEGORY, default="Other").alias("paper_category"),
-                      pl.col("close").dt.year().alias("year"))
+        obs.sort("time")
+        .join_asof(changes, left_on="time", right_on="changed", by="series_ticker", strategy="backward", check_sortedness=False)
+        .join(current, on="series_ticker", how="left").join(has_changes, on="series_ticker", how="left")
         .with_columns(
-            ((won - pl.col("price")) / pl.col("price")).alias("return_pre_fee"),
-            pl.when(pl.col("taker"))
-              .then((won - pl.col("price") - pl.col("fee")) / (pl.col("price") + pl.col("fee")))
-              .otherwise((won - pl.col("price")) / pl.col("price"))
-              .alias("return_post_fee"),
-        )
+            pl.when(pl.col("changed").is_not_null()).then(pl.col("changed_multiplier"))
+              .when(pl.col("has_changes")).then(pl.lit(1.0))
+              .otherwise(pl.col("current_multiplier").fill_null(1.0)).alias("fee_multiplier"),
+            pl.when(pl.col("changed").is_not_null()).then(pl.col("changed_type"))
+              .when(pl.col("has_changes")).then(pl.lit("quadratic"))
+              .otherwise(pl.col("current_type").fill_null("quadratic")).alias("fee_type"))
+        .drop("changed", "changed_multiplier", "changed_type", "current_multiplier", "current_type", "has_changes")
+    )
+
+
+def load(period):
+    """Observations with fees, returns, paper categories and year added."""
+    won = pl.col("won").cast(pl.Float64)
+    obs = pl.read_parquet(DATA / f"observations_{period}.parquet")
+    if period == "paper" and PAPER_FLAT_FEES:
+        obs = obs.with_columns(pl.when(pl.col("taker")).then(fee_per_contract(pl.col("price"), TAKER_FEE_RATE))
+                               .otherwise(0.0).alias("fee"))
+    else:
+        maker_pays = pl.col("fee_type").str.contains("maker") & (pl.col("time") >= MAKER_FEES_START)
+        obs = fees_in_force(obs).with_columns(
+            pl.when(pl.col("taker")).then(fee_per_contract(pl.col("price"), TAKER_FEE_RATE, pl.col("fee_multiplier")))
+              .when(maker_pays).then(fee_per_contract(pl.col("price"), MAKER_FEE_RATE, pl.col("fee_multiplier")))
+              .otherwise(0.0).alias("fee"))
+    return (
+        obs.with_columns(pl.col("category").replace_strict(PAPER_CATEGORY, default="Other").alias("paper_category"),
+                         pl.col("close").dt.year().alias("year"))
+        .with_columns(((won - pl.col("price")) / pl.col("price")).alias("return_pre_fee"),
+                      ((won - pl.col("price") - pl.col("fee")) / (pl.col("price") + pl.col("fee"))).alias("return_post_fee"))
     )
 
 
@@ -96,11 +133,11 @@ def returns_by_price(obs):
             pl.col("won").mean().alias("win_rate"),
             pl.col("price").mean().alias("avg_price"),
             pl.col("return_pre_fee").mean().alias("return_pre_fee"),
-            *mean_with_ci(pl.col("return_post_fee")),
             pl.col("return_post_fee").filter(pl.col("taker")).mean().alias("taker_return"),
             pl.col("return_post_fee").filter(~pl.col("taker")).mean().alias("maker_return"),
             (100 * (~pl.col("taker")).mean()).alias("maker_share"),
-        ).rename({"mean": "return_post_fee"})
+        ).join(mean_with_ci(obs, "price_range", "return_post_fee").select(
+            "price_range", pl.col("mean").alias("return_post_fee"), "ci_low", "ci_high"), on="price_range")
     ).with_columns(pl.Series("paper_maker_share", PAPER["table_10_maker_share"]))
 
 
@@ -128,11 +165,65 @@ def regressions(obs):
     for q in range(1, 6):
         add("6", f"volume quintile {q}", closing.filter(pl.col("volume_q") == q), PAPER["table_6_psi"][q - 1], cluster_by=event)
         add("7", f"trade size quintile {q}", closing.filter(pl.col("size_q") == q), PAPER["table_7_psi"][q - 1], cluster_by=event)
-    for category, psi in {**PAPER["table_8_psi"], "Sports": None}.items():
-        add("8", category, yes.filter(pl.col("paper_category") == category), psi)
+    for category, psi in PAPER["table_8_psi"].items():
+        if category != "Other":
+            add("8", category, yes.filter(pl.col("paper_category") == category), psi)
+    add("8", "Other excl. Sports", yes.filter(pl.col("paper_category") == "Other"), None)
+    add("8", "Sports", yes.filter(pl.col("paper_category") == "Sports"), None)
+    add("8", "Other incl. Sports (paper's Other)", yes.filter(pl.col("paper_category").is_in(["Other", "Sports"])),
+        PAPER["table_8_psi"]["Other"])
     for year in sorted(yes["year"].unique()):
         add("9", year, yes.filter(pl.col("year") == year), PAPER["table_9_psi"].get(year))
     return pl.DataFrame(rows).sort("table", maintain_order=True)
+
+
+def table_3(obs):
+    """Average final volume by decile of closing Yes contracts (paper Table 3). Checks that volume in
+    contracts is the paper's dollar volume."""
+    closing = obs.filter((pl.col("side") == "yes") & (pl.col("days_before") == 0))
+    return (closing.with_columns((pl.col("volume").rank("ordinal") * 10 / (pl.len() + 1)).floor().cast(pl.Int32).add(1).alias("decile"))
+            .group_by("decile").agg(pl.col("volume").mean().round(0).alias("mean_volume"), pl.len()).sort("decile")
+            .with_columns(pl.Series("paper_mean_volume", PAPER["table_3_mean_volume"])))
+
+
+def favourites_by_day(obs):
+    """Favourites priced FAVOURITE_MIN to FAVOURITE_MAX, average return after fees by days before the last trade,
+    for Takers and Makers, with event-clustered intervals. The strategy question (REVIEW.md H3)."""
+    fav = obs.filter((pl.col("price") >= FAVOURITE_MIN) & (pl.col("price") <= FAVOURITE_MAX))
+    taker = mean_with_ci(fav.filter(pl.col("taker")), "days_before", "return_post_fee").rename(
+        {"mean": "taker_return", "ci_low": "taker_ci_low", "ci_high": "taker_ci_high", "n": "taker_n"})
+    maker = mean_with_ci(fav.filter(~pl.col("taker")), "days_before", "return_post_fee").select(
+        "days_before", pl.col("mean").alias("maker_return"), pl.col("n").alias("maker_n"))
+    return taker.drop("clusters").join(maker, on="days_before").sort("days_before")
+
+
+def early_close(obs):
+    """Leakage checks for close times (REVIEW.md H4), one row per contract (closing Yes snapshot).
+
+    - ticker_date: the date in the event ticker, fixed at listing (`scheduled_close`). Markets that closed more
+      than a day before it closed early; if their Yes rate differs, the final close leaks the outcome.
+    - expected_expiration: a value on today's market record. If its position relative to the close predicts
+      the outcome, it was updated after the fact and leaks too.
+    """
+    contracts = obs.filter((pl.col("side") == "yes") & (pl.col("days_before") == 0))
+    by_ticker = (
+        contracts.with_columns(
+            pl.when(pl.col("scheduled_close").is_null()).then(pl.lit("no date in ticker"))
+              .when(pl.col("close") < pl.col("scheduled_close") - pl.duration(days=1)).then(pl.lit("closed > 1 day before ticker date"))
+              .otherwise(pl.lit("closed on or after ticker date")).alias("group"))
+        .group_by("group").agg(pl.len().alias("contracts"), (pl.col("result") == "yes").mean().alias("yes_rate"))
+        .with_columns(pl.lit("ticker_date").alias("check"))
+    )
+    by_expected = (
+        contracts.with_columns(
+            pl.when(pl.col("expected_expiration").is_null()).then(pl.lit("missing"))
+              .when(pl.col("expected_expiration") < pl.col("close")).then(pl.lit("expected expiration before close"))
+              .when(pl.col("expected_expiration") > pl.col("close") + pl.duration(days=1)).then(pl.lit("expected expiration > 1 day after close"))
+              .otherwise(pl.lit("expected expiration within a day after close")).alias("group"))
+        .group_by("group").agg(pl.len().alias("contracts"), (pl.col("result") == "yes").mean().alias("yes_rate"))
+        .with_columns(pl.lit("expected_expiration").alias("check"))
+    )
+    return pl.concat([by_ticker, by_expected]).select("check", "group", "contracts", "yes_rate").sort("check", "group")
 
 
 def returns_by_group(obs, column):
@@ -145,8 +236,8 @@ def returns_by_group(obs, column):
 
 def figure_win_rate_and_returns(obs, by_price, path):
     """Paper Figures 3 and 5: win rate by price, and returns including Taker fees by price range."""
-    by_cent = (obs.with_columns((pl.col("price") * 100).round(0).alias("cents"))
-               .group_by("cents").agg(*mean_with_ci(pl.col("won").cast(pl.Float64))).sort("cents"))
+    by_cent = mean_with_ci(obs.with_columns((pl.col("price") * 100).round(0).alias("cents"), pl.col("won").cast(pl.Float64)),
+                           "cents", "won").sort("cents")
     fig, (left, right) = plt.subplots(1, 2, figsize=(12, 4.5))
     left.fill_between(by_cent["cents"], 100 * by_cent["ci_low"], 100 * by_cent["ci_high"], alpha=0.3)
     left.plot(by_cent["cents"], 100 * by_cent["mean"], lw=1)
@@ -203,6 +294,13 @@ def main(period):
     show("regressions", regressions(obs), out)
     show("returns_by_category", returns_by_group(obs, "paper_category"), out)
     show("returns_by_year", returns_by_group(obs, "year"), out)
+    show("table_3", table_3(obs), out)
+
+    later = obs.filter(pl.col("days_before") >= 1)        # without the closing-day price (REVIEW.md H3)
+    show("average_returns_days_1_10", average_returns(later), out)
+    show("returns_by_price_days_1_10", returns_by_price(later), out)
+    show("favourites_by_day", favourites_by_day(obs), out)
+    show("early_close", early_close(obs), out)
 
     figure_win_rate_and_returns(obs, by_price, out / "figure_3_5.png")
     figure_makers_takers(by_price, out / "figure_6.png")

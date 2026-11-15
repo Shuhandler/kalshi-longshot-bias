@@ -7,11 +7,19 @@ Steps (Bürgi, Deng and Whelan, section 3.1):
 1. Load markets and daily candles (data/markets.parquet and data/candles.parquet from download_data.py),
    keeping sports and the daily markets inside "hourly" series if config.py says so.
 2. Apply the paper's filters: settled Yes or No, at least $1,000 volume, open at least 24 hours,
-   final bid-ask spread of 20c or less.
+   final bid-ask spread between 0 and 20c. The "final" spread comes from the last daily candle, which ends
+   at midnight New York time, so it is measured a median of 10 to 16 hours before close (REVIEW.md M5).
 3. Price snapshots from the trades: the last trade, and the price as of exactly 1 to 10 days
-   (24-hour steps) before it, carrying the most recent earlier trade forward. This reading
-   reproduces the paper's Table 1; 24-hour windows, calendar days and windows from the close do not.
+   (24-hour steps) before it, carrying the most recent earlier trade forward. Of the readings we tried
+   (24-hour windows, calendar days, windows from the close) this one comes closest to the paper's Table 1:
+   rows 2 to 9 match closely, but "closing day only" is short by about 6,000 contracts (REVIEW.md M6).
 4. One Yes and one No observation per snapshot.
+
+Close times: `close` is the final close, which for markets that can close early is only known afterwards.
+`expected_expiration` is also a final value on today's market record, so it may leak too. `scheduled_close`
+comes from the date written into the event ticker (e.g. KXHIGHNY-25JAN17), which is fixed when the market is
+listed: the end of that day in New York. Use it for any strategy timing (REVIEW.md H4). Tickers with only a
+month (e.g. CPI-23SEP, the data month, not the release date) or only a year give no scheduled close (null).
 
 Writes data/observations_paper.parquet and data/observations_oos.parquet, which replicate.py reads,
 and data/trade_tickers.parquet, which `download_data.py trades` reads.
@@ -31,13 +39,15 @@ def load_markets_and_candles():
     markets = (
         pl.read_parquet(DATA / "markets.parquet")
         .select("ticker", "event_ticker", "series_ticker", "market_type", "strike_type", "result", "source", "category",
-                "hourly_series",
+                "hourly_series", (pl.col("can_close_early") == "True").alias("can_close_early"),
+                pl.col("expected_expiration_time").str.to_datetime(time_zone="UTC", strict=False).alias("expected_expiration"),
                 pl.col("volume_fp").cast(pl.Float64).alias("volume"),
                 pl.col("last_price_dollars").cast(pl.Float64).alias("reported_last_price"),
                 pl.col("open_time").str.to_datetime(time_zone="UTC").alias("open"),
                 pl.col("close_time").str.to_datetime(time_zone="UTC").alias("close"))
         .join(events, on="event_ticker", how="left")
-        .with_columns(pl.coalesce("category", "event_category").alias("category"))   # series not in Kalshi's list
+        .with_columns(pl.coalesce("category", "event_category").alias("category"),   # series not in Kalshi's list
+                      scheduled_close(pl.col("event_ticker")).alias("scheduled_close"))
         .drop("event_category")
     )
     if not INCLUDE_SPORTS:
@@ -46,6 +56,19 @@ def load_markets_and_candles():
         markets = markets.filter(~pl.col("hourly_series"))
     candles = pl.read_parquet(DATA / "candles.parquet").filter(pl.col("ticker").is_in(markets["ticker"].implode()))
     return markets, candles
+
+
+MONTHS = {m: i + 1 for i, m in enumerate(["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"])}
+
+
+def scheduled_close(event_ticker):
+    """End of the day written into the event ticker (YYMMMDD after the series part), in New York time, as UTC.
+    Null when the ticker has no full date."""
+    parts = event_ticker.str.extract_groups(r"-[A-Z]*(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})")
+    day = pl.concat_str(parts.struct.field("1"),
+                        parts.struct.field("2").replace_strict(MONTHS, default=None, return_dtype=pl.Int32).cast(pl.String).str.zfill(2),
+                        parts.struct.field("3")).str.to_date("%y%m%d", strict=False)        # impossible dates -> null
+    return (day.cast(pl.Datetime("us")) + pl.duration(days=1)).dt.replace_time_zone("America/New_York").dt.convert_time_zone("UTC")
 
 
 def final_spread(markets, candles):
@@ -65,38 +88,37 @@ def final_spread(markets, candles):
     )
 
 
-def contract_types(markets):
-    """Paper Table 4 types: Single, Non-exclusive, Exclusive numerical, Exclusive other."""
-    per_event = markets.group_by("event_ticker").agg(pl.col("ticker").n_unique().alias("contracts_in_event"))
-    return (
-        markets.join(per_event, on="event_ticker")
-        .select("ticker",
-                pl.when(pl.col("contracts_in_event") == 1).then(pl.lit("Single"))
-                  .when(pl.col("mutually_exclusive").is_null()).then(pl.lit("Unknown"))     # event details not downloaded
-                  .when(~pl.col("mutually_exclusive")).then(pl.lit("Non-exclusive"))
-                  .when(pl.col("strike_type").is_in(NUMERICAL_STRIKES)).then(pl.lit("Exclusive numerical"))
-                  .otherwise(pl.lit("Exclusive other")).alias("contract_type"))
-    )
+def contract_types(sample):
+    """Paper Table 4 types: Single, Non-exclusive, Exclusive numerical, Exclusive other.
+    Contracts per event are counted within the sample (traded contracts that pass the filters), as the paper
+    speaks of traded contracts per event; numerical means Kalshi's strike type is greater, less or between."""
+    per_event = sample.group_by("event_ticker").agg(pl.col("ticker").n_unique().alias("contracts_in_event"))
+    return sample.join(per_event, on="event_ticker").with_columns(
+        pl.when(pl.col("contracts_in_event") == 1).then(pl.lit("Single"))
+          .when(pl.col("mutually_exclusive").is_null()).then(pl.lit("Unknown"))     # event details not downloaded
+          .when(~pl.col("mutually_exclusive")).then(pl.lit("Non-exclusive"))
+          .when(pl.col("strike_type").is_in(NUMERICAL_STRIKES)).then(pl.lit("Exclusive numerical"))
+          .otherwise(pl.lit("Exclusive other")).alias("contract_type"))
 
 
 def build_sample(markets, candles):
     """Markets passing the paper's filters, with their period ("paper" or "oos")."""
     paper_start, _ = PERIODS["paper"]
     paper_end, oos_end = PERIODS["oos"]
-    return (
+    sample = (
         markets
         .join(final_spread(markets, candles), on="ticker")
-        .join(contract_types(markets), on="ticker")
         .filter(
             (pl.col("market_type") == "binary")
             & pl.col("result").is_in(["yes", "no"])
             & (pl.col("volume") >= MIN_VOLUME_DOLLARS)
-            & (pl.col("final_spread") <= MAX_FINAL_SPREAD)
+            & (pl.col("final_spread") >= 0) & (pl.col("final_spread") <= MAX_FINAL_SPREAD)   # a crossed book is bad data
             & ((pl.col("close") - pl.col("open")) >= pl.duration(hours=MIN_HOURS_OPEN))
             & (pl.col("close") >= paper_start) & (pl.col("close") < oos_end)
         )
         .with_columns(pl.when(pl.col("close") < paper_end).then(pl.lit("paper")).otherwise(pl.lit("oos")).alias("period"))
     )
+    return contract_types(sample)
 
 
 def trade_files(period, series):
@@ -109,8 +131,9 @@ def trade_files(period, series):
 
 def snapshots_from_trades(raw):
     """Price snapshots for the markets in one trade file, plus each market's average trade size in dollars."""
-    # A market listed in both the archive and the live endpoint had its trades downloaded twice; drop exact repeats
-    trades = raw.unique().select(
+    # De-duplicate on trade_id where the file has it. Older files have no trade_id; they were repaired so each
+    # market's trades appear once (REVIEW.md H2), and identical-looking rows there are distinct trades (M4).
+    trades = (raw.unique("trade_id") if "trade_id" in raw.columns else raw).select(
         "ticker",
         pl.col("created_time").str.to_datetime(time_zone="UTC", format="%Y-%m-%dT%H:%M:%S%.fZ").alias("time"),
         pl.col("yes_price_dollars").cast(pl.Float64).alias("yes_price"),
@@ -153,6 +176,9 @@ def build_observations(sample, period):
     mismatch = snapshots.filter((pl.col("days_before") == 0) & ((pl.col("yes_price") - pl.col("reported_last_price")).abs() > 1e-6))["ticker"]
     snapshots = snapshots.filter(~pl.col("ticker").is_in(mismatch.implode()))
     print(f"{period}: dropped {len(mismatch):,} contracts whose last trade does not match the reported last price (paper: 63)")
+
+    duplicates = snapshots.group_by("ticker", "days_before").len().filter(pl.col("len") > 1)
+    assert len(duplicates) == 0, f"{period}: {len(duplicates):,} repeated (ticker, days_before) snapshots"
 
     yes_rows = snapshots.with_columns(pl.lit("yes").alias("side"), pl.col("yes_price").alias("price"),
                                       (pl.col("result") == "yes").alias("won"))

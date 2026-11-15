@@ -11,7 +11,7 @@ DATA = Path("data")
 RESULTS = Path("results")
 
 # --- Sample dates ---
-PAPER_START = dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc)
+PAPER_START = dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc)   # Kalshi launched July 2021; nothing earlier exists
 PAPER_END = dt.datetime(2025, 5, 1, tzinfo=dt.timezone.utc)     # paper sample ends April 2025
 OOS_END = dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc)      # out of sample: May 2025 to 31 Oct 2026
 PERIODS = {"paper": (PAPER_START, PAPER_END), "oos": (PAPER_END, OOS_END)}
@@ -27,10 +27,23 @@ MAX_FINAL_SPREAD = 0.20
 MIN_HOURS_OPEN = 24
 SNAPSHOT_DAYS = 10          # prices at the last trade and 1 to 10 days before it
 
-# --- Fees and strategy ---
-TAKER_FEE_RATE = 0.07       # fee = 0.07 * p * (1 - p) per contract, rounded up to the cent per order
-FEE_ORDER_SIZE = 100        # the paper prices the round-up on an order of 100 contracts
-INTEREST_RATE = 0.035       # annual interest on cash and positions
+# --- Fees ---
+# Kalshi fee schedule (PDF, trading fees "effective July 7, 2026"; read 2026-11-14, see REVIEW.md M1):
+#   taker = round up(M x 0.07   x C x P x (1 - P)), M = the series' fee multiplier (usually 1)
+#   maker = round up(M x 0.0175 x C x P x (1 - P)), only on series with fee type quadratic_with_maker_fees
+# The paper (section 3.3) prices the round-up to the cent on an order of 100 contracts; we keep that convention.
+# Kalshi now rounds to $0.000001 per fill with a per-order accumulator, so this slightly overstates small fees.
+TAKER_FEE_RATE = 0.07
+MAKER_FEE_RATE = 0.0175
+FEE_ORDER_SIZE = 100
+MAKER_FEES_START = dt.datetime(2025, 5, 1, tzinfo=dt.timezone.utc)   # paper: makers paid nothing before May 2025
+PAPER_FLAT_FEES = True      # paper period: the paper's flat 0.07 taker fee, no maker fee, no multipliers
+
+# --- Interest (Kalshi APY page, read 2026-11-14): 3.50% on cash and open positions marked at last price,
+#     "variable and can change at any time"; no rate history is published. Report results at both bounds. ---
+INTEREST_RATES = (0.0, 0.035)
+
+# --- Strategy ---
 FAVOURITE_MIN, FAVOURITE_MAX = 0.85, 0.97
 MIN_DAYS_TO_CLOSE, MAX_DAYS_TO_CLOSE = 1, 21
 EVENT_CAP = 0.03
@@ -43,7 +56,9 @@ PRICE_RANGES = ["1c-10c", "11c-20c", "21c-30c", "31c-40c", "41c-50c",
 # --- Paper categories (Table 8). Kalshi's Elections counts as Politics; the rest is Other. ---
 PAPER_CATEGORY = {"Financials": "Financials", "Climate and Weather": "Climate & Weather", "Crypto": "Crypto",
                   "Politics": "Politics", "Elections": "Politics", "Entertainment": "Entertainment",
-                  "Economics": "Economics", "Sports": "Sports"}   # Sports is its own group (the paper's Other)
+                  "Economics": "Economics", "Sports": "Sports"}
+# Sports gets its own group here. The paper's "Other" almost certainly included sports (from January 2025), so
+# Table 8 also reports "Other incl. Sports" against the paper's Other.
 NUMERICAL_STRIKES = ["greater", "greater_or_equal", "less", "less_or_equal", "between"]
 
 # --- The paper's published numbers, for comparison (January 2026 version) ---
@@ -57,6 +72,7 @@ PAPER = {
                     "Exclusive other": 0.020, "All exclusive": 0.017},
     "table_4_constant": -1.736,
     "table_5_psi": [0.036, 0.017, 0.041, 0.036, 0.032, 0.029, 0.021, 0.037, 0.035, 0.040, 0.038],
+    "table_3_mean_volume": [1_199, 1_735, 2_455, 3_593, 5_454, 8_481, 13_387, 21_286, 35_960, 526_245],
     "table_6_psi": [0.045, 0.039, 0.032, 0.036, 0.032],
     "table_7_psi": [0.036, 0.033, 0.038, 0.034, 0.043],
     "table_8_psi": {"Financials": 0.032, "Climate & Weather": 0.031, "Crypto": 0.058, "Politics": 0.022,

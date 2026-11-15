@@ -80,3 +80,12 @@ PAPER = {
     "table_9_psi": {2021: 0.041, 2022: 0.023, 2023: 0.036, 2024: 0.048, 2025: 0.021},
     "table_10_maker_share": [43.5, 46.7, 48.9, 47.8, 49.5, 50.4, 52.2, 51.1, 53.3, 56.5],
 }
+
+# --- Backtest (backtest.py). Chosen on the paper period only, then frozen for the one out-of-sample run. ---
+START_NAV = 100_000                 # dollars (Jordan, 2026-11-15)
+MIN_DAY_VOLUME = 500                # contracts traded on the entry day (that day's candle), so we only buy what trades
+MAX_ENTRY_SPREAD = 0.05             # bid-ask spread on the entry day's candle; wider quotes are stale or one-sided (Jordan, 2026-11-15)
+VOLUME_SHARE = 0.10                 # at most this share of the entry day's traded volume
+CATEGORY_CAP = 0.20                 # open positions per category, share of NAV (cost basis)
+MAKER_ORDER_DAYS = 1                # a maker order rests this many days after it is posted, then is cancelled
+FOCUS_CATEGORIES = ["Climate & Weather", "Politics", "Financials", "Entertainment"]   # strategies B and D

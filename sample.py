@@ -16,10 +16,13 @@ Steps (Bürgi, Deng and Whelan, section 3.1):
 4. One Yes and one No observation per snapshot.
 
 Close times: `close` is the final close, which for markets that can close early is only known afterwards.
-`expected_expiration` is also a final value on today's market record, so it may leak too. `scheduled_close`
-comes from the date written into the event ticker (e.g. KXHIGHNY-25JAN17), which is fixed when the market is
-listed: the end of that day in New York. Use it for any strategy timing (REVIEW.md H4). Tickers with only a
-month (e.g. CPI-23SEP, the data month, not the release date) or only a year give no scheduled close (null).
+`expected_expiration` is also a final value on today's market record and leaks too. `scheduled_close` is the
+close date a trader could know when buying (REVIEW.md H4), taken in this order (`close_date_source` says which):
+  day    - the date in the event ticker (e.g. KXHIGHNY-25JAN17): end of that day in New York;
+  latest - otherwise Kalshi's latest_expiration_time (Jordan, 2026-11-15; no month or year fallback). It is
+           mostly fixed at listing, but in the paper period about 2.6% of markets had it changed in a way that
+           predicts the outcome, so it is only a gap filler. It is the latest possible expiry, usually about a
+           week after the real close, so time to close is overstated for these markets.
 
 Writes data/observations_paper.parquet and data/observations_oos.parquet, which replicate.py reads,
 and data/trade_tickers.parquet, which `download_data.py trades` reads.
@@ -41,13 +44,14 @@ def load_markets_and_candles():
         .select("ticker", "event_ticker", "series_ticker", "market_type", "strike_type", "result", "source", "category",
                 "hourly_series", (pl.col("can_close_early") == "True").alias("can_close_early"),
                 pl.col("expected_expiration_time").str.to_datetime(time_zone="UTC", strict=False).alias("expected_expiration"),
+                pl.col("latest_expiration_time").str.to_datetime(time_zone="UTC", strict=False).alias("latest_expiration"),
                 pl.col("volume_fp").cast(pl.Float64).alias("volume"),
                 pl.col("last_price_dollars").cast(pl.Float64).alias("reported_last_price"),
                 pl.col("open_time").str.to_datetime(time_zone="UTC").alias("open"),
                 pl.col("close_time").str.to_datetime(time_zone="UTC").alias("close"))
         .join(events, on="event_ticker", how="left")
         .with_columns(pl.coalesce("category", "event_category").alias("category"),   # series not in Kalshi's list
-                      scheduled_close(pl.col("event_ticker")).alias("scheduled_close"))
+                      *scheduled_close(pl.col("event_ticker"), pl.col("latest_expiration")))
         .drop("event_category")
     )
     if not INCLUDE_SPORTS:
@@ -61,14 +65,24 @@ def load_markets_and_candles():
 MONTHS = {m: i + 1 for i, m in enumerate(["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"])}
 
 
-def scheduled_close(event_ticker):
-    """End of the day written into the event ticker (YYMMMDD after the series part), in New York time, as UTC.
-    Null when the ticker has no full date."""
-    parts = event_ticker.str.extract_groups(r"-[A-Z]*(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})")
-    day = pl.concat_str(parts.struct.field("1"),
-                        parts.struct.field("2").replace_strict(MONTHS, default=None, return_dtype=pl.Int32).cast(pl.String).str.zfill(2),
-                        parts.struct.field("3")).str.to_date("%y%m%d", strict=False)        # impossible dates -> null
+def new_york_day_end(day):
+    """End of a calendar day in New York, as UTC."""
     return (day.cast(pl.Datetime("us")) + pl.duration(days=1)).dt.replace_time_zone("America/New_York").dt.convert_time_zone("UTC")
+
+
+def ticker_day_close(event_ticker):
+    """End of the day written in the event ticker (YYMMMDD after the series part); null if there is no full date."""
+    parts = event_ticker.str.extract_groups(r"-[A-Z]*(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})")
+    month = parts.struct.field("2").replace_strict(MONTHS, default=None, return_dtype=pl.Int32).cast(pl.String).str.zfill(2)
+    day = pl.concat_str(parts.struct.field("1"), month, parts.struct.field("3")).str.to_date("%y%m%d", strict=False)
+    return new_york_day_end(day)                                   # impossible dates (e.g. 25FEB31) -> null
+
+
+def scheduled_close(event_ticker, latest_expiration):
+    """Close date known at entry and where it came from (see the module docstring)."""
+    day = ticker_day_close(event_ticker)
+    return (pl.coalesce(day, latest_expiration).alias("scheduled_close"),
+            pl.when(day.is_not_null()).then(pl.lit("day")).otherwise(pl.lit("latest")).alias("close_date_source"))
 
 
 def final_spread(markets, candles):

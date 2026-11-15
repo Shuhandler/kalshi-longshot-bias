@@ -87,7 +87,8 @@ buying (85–97c favourites, interest carry on cash). The full plan is in [PLAN.
   (`download_data.py fees` -> `data/fee_changes.parquet`) and a 0.0175 maker fee on maker-fee series.
 - Interest: no rate history exists; report results at 0% and 3.5% (`config.INTEREST_RATES`).
 - `close` is the final close and leaks the outcome for early-closing markets; so does `expected_expiration`
-  (a value on today's record). Use `scheduled_close`, the end of the day written in the event ticker (fixed
-  at listing; null when the ticker has no full date), for any strategy timing. `replicate.py` writes the
+  (a value on today's record). Use `scheduled_close` for any strategy timing: the day in the event ticker, else
+  `latest_expiration_time` (Jordan, 2026-11-15: no month or year fallback; latest leaks for ~2.6% of
+  paper-period markets). `close_date_source` records which was used. `replicate.py` writes the
   leakage check to `results/{period}/early_close.csv`.
 - Confidence intervals in `stats.mean_with_ci` are clustered by event.

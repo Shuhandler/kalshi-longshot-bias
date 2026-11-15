@@ -200,19 +200,20 @@ def favourites_by_day(obs):
 def early_close(obs):
     """Leakage checks for close times (REVIEW.md H4), one row per contract (closing Yes snapshot).
 
-    - ticker_date: the date in the event ticker, fixed at listing (`scheduled_close`). Markets that closed more
-      than a day before it closed early; if their Yes rate differs, the final close leaks the outcome.
+    - scheduled_close, by source (day, month, year from the ticker; latest = latest_expiration_time). Markets
+      that closed more than a day before it closed early; if their Yes rate differs, the final close leaks.
     - expected_expiration: a value on today's market record. If its position relative to the close predicts
       the outcome, it was updated after the fact and leaks too.
     """
     contracts = obs.filter((pl.col("side") == "yes") & (pl.col("days_before") == 0))
     by_ticker = (
         contracts.with_columns(
-            pl.when(pl.col("scheduled_close").is_null()).then(pl.lit("no date in ticker"))
-              .when(pl.col("close") < pl.col("scheduled_close") - pl.duration(days=1)).then(pl.lit("closed > 1 day before ticker date"))
-              .otherwise(pl.lit("closed on or after ticker date")).alias("group"))
+            pl.concat_str(pl.col("close_date_source"), pl.lit(": "),
+                          pl.when(pl.col("close") < pl.col("scheduled_close") - pl.duration(days=1))
+                            .then(pl.lit("closed > 1 day before scheduled close"))
+                            .otherwise(pl.lit("closed on or after scheduled close"))).alias("group"))
         .group_by("group").agg(pl.len().alias("contracts"), (pl.col("result") == "yes").mean().alias("yes_rate"))
-        .with_columns(pl.lit("ticker_date").alias("check"))
+        .with_columns(pl.lit("scheduled_close").alias("check"))
     )
     by_expected = (
         contracts.with_columns(
